@@ -1,0 +1,24 @@
+# Long-running worker: settings -> full backfill -> forever live-sync
+# (`hn-indexer run`, the Dockerfile's default CMD). No HTTP server, so no
+# [[services]]/[http_service] block and no public port.
+app = "hackersearch-indexer"
+primary_region = "cdg"
+
+[build]
+
+[env]
+  # Point at your Meilisearch Cloud project (MEILI_MASTER_KEY is set as a
+  # secret, never here — see `fly secrets set`).
+  MEILI_URL = "https://ms-b8aa812a9587-185.par.meilisearch.io"
+  INDEXER_STATE_FILE = "/data/indexer-state.json"
+  # Unset (unbound) = full corpus. Set to a number to cap the initial
+  # backfill depth instead.
+  # BACKFILL_RECENT = "100000"
+
+[mounts]
+  source = "hackersearch_indexer_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
