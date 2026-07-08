@@ -487,7 +487,7 @@ async fn main() -> Result<()> {
                 "auto" => enrich::Cloudflare::from_env(),
                 other => anyhow::bail!("unknown extractor '{other}' (auto|local|cloudflare)"),
             };
-            ctx.meili.apply_settings().await?;
+            ctx.meili.ensure_index().await?;
             enrich_loop(&ctx, max_chars, limit, cloudflare).await?;
         }
         Command::Backfill {
@@ -496,7 +496,7 @@ async fn main() -> Result<()> {
             recent,
             since_days,
         } => {
-            ctx.meili.apply_settings().await?;
+            ctx.meili.ensure_index().await?;
             let (from, to) = if let Some(days) = since_days {
                 let max = hn::max_item(&ctx.hn).await?;
                 let now = std::time::SystemTime::now()
@@ -526,11 +526,11 @@ async fn main() -> Result<()> {
             );
         }
         Command::Sync { interval } => {
-            ctx.meili.apply_settings().await?;
+            ctx.meili.ensure_index().await?;
             sync(&ctx, interval).await?;
         }
         Command::Run { recent, interval } => {
-            ctx.meili.apply_settings().await?;
+            ctx.meili.ensure_index().await?;
             let max = hn::max_item(&ctx.hn).await?;
             let to = recent.map(|n| max.saturating_sub(n).max(1)).unwrap_or(1);
 

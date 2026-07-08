@@ -37,6 +37,27 @@ impl Meili {
         Ok(())
     }
 
+    /// Create and configure the index only when it doesn't exist yet.
+    /// Existing indexes are left completely untouched — no settings task,
+    /// no reindex, no startup stall. Settings changes are pushed explicitly
+    /// with the `settings` command.
+    pub async fn ensure_index(&self) -> Result<()> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/indexes/{INDEX_UID}"))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("checking index '{INDEX_UID}': {status}: {body}");
+        }
+        tracing::info!("index '{INDEX_UID}' does not exist — creating and configuring it");
+        self.apply_settings().await
+    }
+
     /// Create the index (idempotent) and apply the search configuration.
     pub async fn apply_settings(&self) -> Result<()> {
         // Index creation is a task; if the index already exists the task
