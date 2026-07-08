@@ -181,7 +181,8 @@ function PageButton({
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        "grid size-7 place-items-center border tabular-nums transition-colors",
+        // min-w keeps 1-2 digit pages square; longer numbers grow via padding.
+        "flex h-7 min-w-7 items-center justify-center border px-1.5 tabular-nums transition-colors",
         active
           ? "border-primary bg-primary text-primary-foreground"
           : "bg-card text-muted-foreground hover:border-primary hover:text-primary",
