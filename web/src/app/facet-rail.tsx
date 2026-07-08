@@ -63,8 +63,10 @@ export function FacetRail({
 }: FacetRailProps) {
   const isComments = state.scope === "comments";
 
+  // Stickiness is the desktop rail's concern (see search-app.tsx) — this
+  // component also renders inside the mobile filter sheet.
   return (
-    <div className="sticky top-6 flex flex-col gap-4">
+    <div className="flex flex-col gap-4">
       {!isComments && (
       <Section title="Type">
         <ul className="flex flex-col gap-1.5">

@@ -1,10 +1,24 @@
 "use client";
 
-import { MessagesSquare, Newspaper, Search, Sparkles, X } from "lucide-react";
+import {
+  MessagesSquare,
+  Newspaper,
+  Search,
+  SlidersHorizontal,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Input } from "@/components/ui/input";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
 import { EMBEDDER } from "@/lib/meili";
 import { useDebounced, useHNSearch, useIndexStats } from "@/hooks/use-hn-search";
 import {
@@ -86,6 +100,34 @@ export function SearchApp() {
   const search = useHNSearch(queryState);
   const stats = useIndexStats();
 
+  const resetFilters = () =>
+    update({
+      tags: [],
+      domains: [],
+      authors: [],
+      dateRange: "all",
+      minPoints: 0,
+    });
+  const activeFilterCount =
+    state.tags.length +
+    state.domains.length +
+    state.authors.length +
+    (state.dateRange !== "all" ? 1 : 0) +
+    (state.minPoints > 0 ? 1 : 0);
+  // Rendered twice: in the desktop rail and inside the mobile filter sheet.
+  const facetRail = (
+    <FacetRail
+      state={state}
+      facets={search.data?.facets}
+      onChange={update}
+      onReset={resetFilters}
+      showReset={hasActiveFilters(state)}
+    />
+  );
+  const sortTabs = SORT_TABS.filter(
+    (tab) => state.scope !== "comments" || tab.value !== "points",
+  );
+
   return (
     <div className="flex min-h-dvh flex-col">
       <header className="border-b bg-card">
@@ -152,80 +194,112 @@ export function SearchApp() {
             )}
           </div>
 
-          <div className="mt-3 flex items-end justify-between">
+          <div className="mt-3 flex items-end justify-between gap-2">
             <nav className="flex gap-0">
               {SCOPE_TABS.map((tab) => (
                 <button
                   key={tab.value}
                   onClick={() => setScope(tab.value)}
                   className={cn(
-                    "flex items-center gap-2 border-x border-t border-transparent px-4 py-2 text-sm font-medium transition-colors",
+                    "flex items-center gap-2 border-x border-t border-transparent px-3 py-2 text-sm font-medium transition-colors sm:px-4",
                     state.scope === tab.value
                       ? "border-border bg-background text-primary"
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
-                  <tab.icon className="size-4" />
+                  <tab.icon className="size-4 max-sm:hidden" />
                   {tab.label}
                 </button>
               ))}
             </nav>
 
-            <nav className="flex items-end gap-0">
+            <div className="flex items-center gap-2 pb-1 sm:pb-0">
               {EMBEDDER && (
                 <button
                   onClick={() => update({ semantic: !state.semantic })}
                   title="Blend keyword and vector search (embeds titles + crawled article content)"
                   className={cn(
-                    "mr-2 flex items-center gap-1.5 border px-3 py-1.5 font-mono text-xs transition-colors",
+                    "flex items-center gap-1.5 border px-3 py-1.5 font-mono text-xs transition-colors",
                     state.semantic
                       ? "border-primary bg-primary text-primary-foreground"
                       : "bg-card text-muted-foreground hover:border-primary hover:text-primary",
                   )}
                 >
                   <Sparkles className="size-3.5" />
-                  semantic
+                  <span className="hidden sm:inline">semantic</span>
                 </button>
               )}
-              {SORT_TABS.filter(
-                (tab) =>
-                  state.scope !== "comments" || tab.value !== "points",
-              ).map((tab) => (
-                <button
-                  key={tab.value}
-                  onClick={() => update({ sort: tab.value })}
-                  className={cn(
-                    "border-x border-t border-transparent px-4 py-2 font-mono text-xs transition-colors",
-                    state.sort === tab.value
-                      ? "border-border bg-background text-primary"
-                      : "text-muted-foreground hover:text-foreground",
-                  )}
+
+              {/* Mobile: facets live in a sheet; sort collapses to a select. */}
+              <Sheet>
+                <SheetTrigger asChild>
+                  <button
+                    className="relative flex items-center gap-1.5 border bg-card px-2.5 py-1.5 font-mono text-xs text-muted-foreground transition-colors hover:border-primary hover:text-primary md:hidden"
+                    aria-label="Open filters"
+                  >
+                    <SlidersHorizontal className="size-3.5" />
+                    <span className="max-sm:sr-only">filters</span>
+                    {activeFilterCount > 0 && (
+                      <span className="grid size-4 place-items-center bg-primary text-[10px] font-semibold text-primary-foreground">
+                        {activeFilterCount}
+                      </span>
+                    )}
+                  </button>
+                </SheetTrigger>
+                <SheetContent
+                  side="left"
+                  className="w-72 overflow-y-auto bg-background"
                 >
-                  {tab.label}
-                </button>
-              ))}
-            </nav>
+                  <SheetHeader className="pb-0">
+                    <SheetTitle className="font-mono text-xs font-semibold tracking-[0.2em] text-muted-foreground uppercase">
+                      Filters
+                    </SheetTitle>
+                  </SheetHeader>
+                  <div className="px-4 pb-8">{facetRail}</div>
+                </SheetContent>
+              </Sheet>
+
+              <label className="sm:hidden">
+                <span className="sr-only">Sort results</span>
+                <select
+                  value={state.sort}
+                  onChange={(e) =>
+                    update({ sort: e.target.value as SortKey })
+                  }
+                  className="border bg-card px-2 py-1.5 font-mono text-xs text-muted-foreground"
+                >
+                  {sortTabs.map((tab) => (
+                    <option key={tab.value} value={tab.value}>
+                      {tab.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <nav className="hidden items-end gap-0 self-end sm:flex">
+                {sortTabs.map((tab) => (
+                  <button
+                    key={tab.value}
+                    onClick={() => update({ sort: tab.value })}
+                    className={cn(
+                      "border-x border-t border-transparent px-4 py-2 font-mono text-xs transition-colors",
+                      state.sort === tab.value
+                        ? "border-border bg-background text-primary"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </nav>
+            </div>
           </div>
         </div>
       </header>
 
       <main className="mx-auto flex w-full max-w-6xl flex-1 gap-8 px-4 py-6 sm:px-6">
         <aside className="hidden w-56 shrink-0 md:block">
-          <FacetRail
-            state={state}
-            facets={search.data?.facets}
-            onChange={update}
-            onReset={() =>
-              update({
-                tags: [],
-                domains: [],
-                authors: [],
-                dateRange: "all",
-                minPoints: 0,
-              })
-            }
-            showReset={hasActiveFilters(state)}
-          />
+          <div className="sticky top-6">{facetRail}</div>
         </aside>
 
         <section className="min-w-0 flex-1">

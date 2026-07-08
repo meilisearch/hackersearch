@@ -85,7 +85,9 @@ export function HitCard({ hit, onState, state }: HitCardProps) {
       {hit.text && (
         <p
           className={cn(
-            "mt-1 text-sm leading-relaxed text-foreground/85",
+            // overflow-wrap:anywhere keeps long unbreakable strings (URLs
+            // in self-posts) from bleeding past the viewport on mobile.
+            "mt-1 text-sm leading-relaxed text-foreground/85 [overflow-wrap:anywhere]",
             !isComment && "text-foreground/70",
           )}
         >
