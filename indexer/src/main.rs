@@ -535,15 +535,22 @@ async fn main() -> Result<()> {
             let to = recent.map(|n| max.saturating_sub(n).max(1)).unwrap_or(1);
 
             let backfill_ctx = ctx.clone();
+            // A transient Meilisearch/network outage must never kill the
+            // backfill for good: every attempt resumes from the checkpoint,
+            // so retrying forever is safe and loses no progress.
             let backfill_task = tokio::spawn(async move {
-                match resolve_backfill_range(&backfill_ctx, None, to).await {
-                    Ok(Some((from, to))) => {
-                        if let Err(e) = backfill(&backfill_ctx, from, to).await {
-                            warn!("backfill failed: {e:#}");
-                        }
+                loop {
+                    match resolve_backfill_range(&backfill_ctx, None, to).await {
+                        Ok(Some((from, to))) => match backfill(&backfill_ctx, from, to).await {
+                            Ok(()) => break,
+                            Err(e) => {
+                                warn!("backfill failed, resuming from checkpoint in 60s: {e:#}")
+                            }
+                        },
+                        Ok(None) => break,
+                        Err(e) => warn!("backfill setup failed, retrying in 60s: {e:#}"),
                     }
-                    Ok(None) => {}
-                    Err(e) => warn!("backfill setup failed: {e:#}"),
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             });
 

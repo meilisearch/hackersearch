@@ -117,9 +117,12 @@ impl Meili {
         if docs.is_empty() {
             return Ok(None);
         }
+        // ~5 minutes of patience: remote instances can throttle or briefly
+        // stall under sustained ingestion, and giving up here aborts the
+        // caller's whole pipeline.
         let mut delay = std::time::Duration::from_millis(500);
         let mut last_err: Option<anyhow::Error> = None;
-        for _ in 0..5 {
+        for _ in 0..10 {
             let resp = self
                 .request(
                     reqwest::Method::PUT,
@@ -141,7 +144,9 @@ impl Meili {
                 Err(e) => last_err = Some(e.into()),
             }
             tokio::time::sleep(delay).await;
-            delay = delay.saturating_mul(2);
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(60));
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("add_documents: retries exhausted")))
     }
