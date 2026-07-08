@@ -7,6 +7,7 @@ import { useState } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useDebounced } from "@/hooks/use-hn-search";
 import {
+  MAX_FACET_ROWS,
   searchFacetValues,
   type FacetCounts,
   type HNSearchResult,
@@ -204,9 +205,11 @@ function ValueFacet({
   const searching = facetQuery.length > 0;
   const top = Object.entries(distribution ?? {})
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
-  // Searching swaps the top-10 list for facet-search hits over ALL values;
-  // otherwise keep selected values visible even outside the top list.
+    .slice(0, MAX_FACET_ROWS);
+  // Searching swaps the top list for facet-search hits over ALL values;
+  // otherwise pin selected values first so they stay visible even when
+  // they'd otherwise fall out of the top list, then fill up to the cap —
+  // capped so the rail never needs to scroll.
   const rows: (readonly [string, number | undefined])[] = searching
     ? (facetSearch.data ?? []).map((h) => [h.value, h.count] as const)
     : [
@@ -214,7 +217,7 @@ function ValueFacet({
           .filter((v) => !top.some(([name]) => name === v))
           .map((v) => [v, distribution?.[v]] as const),
         ...top,
-      ];
+      ].slice(0, MAX_FACET_ROWS);
   if (rows.length === 0 && !searching) return null;
 
   return (

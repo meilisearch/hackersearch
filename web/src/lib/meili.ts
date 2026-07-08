@@ -162,6 +162,9 @@ export interface FacetValueHit {
   count: number;
 }
 
+// Keeps the domain/author facet lists short enough to never need scrolling.
+export const MAX_FACET_ROWS = 10;
+
 /**
  * Search values of one facet via Meilisearch's facet-search endpoint,
  * scoped to the current query and every OTHER dimension's filters — the same
@@ -178,7 +181,9 @@ export async function searchFacetValues(
     q: s.q,
     filter: buildFilter(s, dim),
   });
-  return res.facetHits;
+  // facet-search has no `limit` param — it's bounded only by the index's
+  // faceting.maxValuesPerFacet (100), so truncate client-side instead.
+  return res.facetHits.slice(0, MAX_FACET_ROWS);
 }
 
 export interface IndexStats {
