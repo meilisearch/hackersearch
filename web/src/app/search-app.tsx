@@ -12,6 +12,7 @@ import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Input } from "@/components/ui/input";
+import { findCompletion } from "@/lib/autocomplete";
 import {
   Sheet,
   SheetContent,
@@ -100,6 +101,14 @@ export function SearchApp() {
   const search = useHNSearch(queryState);
   const stats = useIndexStats();
 
+  // Ghost suffix completing the word being typed, accepted with Tab / →.
+  // Long queries scroll inside the input and the overlay wouldn't track,
+  // so stop suggesting before that point.
+  const ghost = useMemo(() => {
+    if (state.q.length > 40) return "";
+    return findCompletion(state.q, search.data?.hits ?? []);
+  }, [state.q, search.data]);
+
   const resetFilters = () =>
     update({
       tags: [],
@@ -171,6 +180,20 @@ export function SearchApp() {
               ref={inputRef}
               value={state.q}
               onChange={(e) => update({ q: e.target.value })}
+              onKeyDown={(e) => {
+                if (!ghost) return;
+                const el = e.currentTarget;
+                const caretAtEnd =
+                  el.selectionStart === el.value.length &&
+                  el.selectionEnd === el.value.length;
+                if (
+                  (e.key === "Tab" && !e.shiftKey) ||
+                  (e.key === "ArrowRight" && caretAtEnd)
+                ) {
+                  e.preventDefault();
+                  update({ q: state.q + ghost });
+                }
+              }}
               placeholder={
                 state.scope === "comments"
                   ? "Search every HN comment…"
@@ -179,6 +202,17 @@ export function SearchApp() {
               className="h-11 rounded-none border bg-background pr-16 pl-9 font-mono text-sm shadow-none focus-visible:ring-0 focus-visible:border-primary md:text-sm"
               autoFocus
             />
+            {ghost && (
+              // Ghost completion overlay: an invisible copy of the query
+              // keeps the suffix aligned with the caret (monospace font).
+              <div
+                aria-hidden
+                className="pointer-events-none absolute inset-0 flex items-center overflow-hidden border border-transparent pr-16 pl-9 font-mono text-sm whitespace-pre"
+              >
+                <span className="invisible">{state.q}</span>
+                <span className="text-muted-foreground/70">{ghost}</span>
+              </div>
+            )}
             {state.q ? (
               <button
                 onClick={() => update({ q: "" })}
