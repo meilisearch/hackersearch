@@ -46,18 +46,40 @@ impl Meili {
             .send()
             .await?;
 
+        // url, domain, and author are excluded from full-text search: url
+        // is opaque link noise, domain matching produces junk relevance
+        // (e.g. "medium" matching every medium.com post regardless of
+        // content), and same for author names (e.g. "dan" surfacing every
+        // post by user "dang"). Domain/author stay reachable via filters
+        // and the dedicated facet-search endpoint instead.
+        //
+        // filterableAttributes lists each attribute's actual needs instead
+        // of turning every feature on everywhere:
+        // - facetSearch is only needed where the UI calls the facet-search
+        //   endpoint (domain, author — see web/src/lib/meili.ts).
+        // - comparison (<, >, >=, <=) is only needed for the numeric range
+        //   filters the UI actually issues (points, created_at); everything
+        //   else only ever uses equality (=, !=, EXISTS).
         let settings = json!({
-            "searchableAttributes": ["title", "text", "url", "domain", "author"],
+            "searchableAttributes": ["title", "text"],
             "filterableAttributes": [
-                "type", "tags", "author", "domain",
-                "points", "num_comments", "created_at", "parent",
-                "url", "enriched"
+                { "attributePatterns": ["domain", "author"],
+                  "features": { "facetSearch": true, "filter": { "equality": true, "comparison": false } } },
+                { "attributePatterns": ["type", "tags", "url", "enriched", "parent"],
+                  "features": { "facetSearch": false, "filter": { "equality": true, "comparison": false } } },
+                { "attributePatterns": ["points", "num_comments", "created_at"],
+                  "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
             ],
             "sortableAttributes": ["created_at", "points", "num_comments"],
             "rankingRules": [
                 "words", "typo", "proximity", "attribute", "sort", "exactness",
                 "points:desc"
             ],
+            // Terms only need to share an attribute, not sit at an exact
+            // word distance — cheaper to compute and title/text/domain are
+            // independent fields anyway, so exact cross-field distance was
+            // never meaningful.
+            "proximityPrecision": "byAttribute",
             "faceting": { "maxValuesPerFacet": 100 },
             "pagination": { "maxTotalHits": 10000 },
             "typoTolerance": { "minWordSizeForTypos": { "oneTypo": 4, "twoTypos": 9 } }
