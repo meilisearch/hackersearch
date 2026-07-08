@@ -17,8 +17,11 @@ export function findCompletion(q: string, hits: HNHit[]): string {
     for (const source of [hit.title, hit.text]) {
       if (!source) continue;
       for (const raw of source.split(/\s+/)) {
-        // Trim surrounding punctuation ("(Meilisearch," -> "Meilisearch").
-        const word = raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+        // Trim surrounding punctuation ("(Meilisearch," -> "Meilisearch")
+        // and possessives ("Meier's" -> "Meier").
+        const word = raw
+          .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
+          .replace(/['’]s$/iu, "");
         if (word.length > prefix.length && word.toLowerCase().startsWith(lower)) {
           return word.slice(prefix.length);
         }

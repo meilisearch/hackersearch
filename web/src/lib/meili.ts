@@ -48,6 +48,9 @@ export type FacetCounts = Record<string, number>;
 
 export interface HNSearchResult {
   hits: HNHit[];
+  /** Top hits by points for the same query — the source for the inline
+   *  ghost completion, so it always proposes the most popular match. */
+  completionHits: HNHit[];
   totalHits: number;
   totalPages: number;
   page: number;
@@ -135,6 +138,14 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
         facets: [dim],
         limit: 0,
       })),
+      {
+        indexUid: INDEX_UID,
+        q: s.q,
+        filter: buildFilter(s),
+        sort: ["points:desc"],
+        limit: 5,
+        attributesToRetrieve: ["id", "title", "text"],
+      },
     ],
   });
 
@@ -144,6 +155,7 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
 
   return {
     hits: (main.hits as HNHit[]) ?? [],
+    completionHits: (results[4]?.hits as HNHit[]) ?? [],
     totalHits:
       "totalHits" in main ? (main.totalHits as number) : main.hits.length,
     totalPages: "totalPages" in main ? (main.totalPages as number) : 1,

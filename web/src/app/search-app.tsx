@@ -106,7 +106,7 @@ export function SearchApp() {
   // so stop suggesting before that point.
   const ghost = useMemo(() => {
     if (state.q.length > 40) return "";
-    return findCompletion(state.q, search.data?.hits ?? []);
+    return findCompletion(state.q, search.data?.completionHits ?? []);
   }, [state.q, search.data]);
 
   const resetFilters = () =>

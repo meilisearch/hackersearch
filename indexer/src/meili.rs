@@ -71,8 +71,13 @@ impl Meili {
                   "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
             ],
             "sortableAttributes": ["created_at", "points", "num_comments"],
+            // sort sits BEFORE attribute (default is after): when a query
+            // asks for an explicit sort — the UI's Newest/Points modes and
+            // the ghost-completion query's points:desc — it should dominate
+            // over which attribute/position the terms matched in. Queries
+            // without a sort param are unaffected.
             "rankingRules": [
-                "words", "typo", "proximity", "attribute", "sort", "exactness",
+                "words", "typo", "proximity", "sort", "attribute", "exactness",
                 "points:desc"
             ],
             // Terms only need to share an attribute, not sit at an exact
