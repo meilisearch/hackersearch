@@ -1,0 +1,37 @@
+---
+title: Searching
+description: How the web UI queries Meilisearch.
+---
+
+## One round-trip per keystroke
+
+The UI issues a single [`/multi-search`](https://www.meilisearch.com/docs/reference/api/multi_search)
+request containing:
+
+1. the **main query** — paginated, highlighted, cropped;
+2. one **facet-count query per dimension** (`tags`, `domain`, `author`), each
+   with that dimension's own filter removed and `limit: 0`.
+
+This yields *disjunctive* facet counts: checking "Stories" doesn't zero out the
+"Comments" count, so facets behave the way users expect from HN Search.
+
+## Filters
+
+Selections within a facet are ORed, facets are ANDed:
+
+```
+[["tags = story", "tags = show_hn"], ["domain = github.com"], "points >= 100", "created_at >= 1719000000"]
+```
+
+## Safe highlighting
+
+Highlight markers are Unicode private-use-area characters (``/``)
+rather than HTML tags. The React app splits on them and renders `<mark>`
+elements itself — no `dangerouslySetInnerHTML`, no XSS surface, even though the
+indexed corpus is user-generated content.
+
+## URL state
+
+Every piece of search state (`q`, `tags`, `domains`, `authors`, `date`,
+`points`, `sort`, `page`) round-trips through the query string, so any search
+is a shareable, bookmarkable link. Press <kbd>/</kbd> to focus the search box.

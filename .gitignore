@@ -1,0 +1,8 @@
+target/
+node_modules/
+.next/
+.env.local
+.env*.local
+indexer-state.json
+*.log
+.DS_Store

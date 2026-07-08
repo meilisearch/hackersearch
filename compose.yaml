@@ -1,0 +1,79 @@
+name: hackersearch
+
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.15
+    ports:
+      # 7701 on the host: 7700 is commonly taken by other local Meilisearch instances.
+      - "7701:7700"
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-hackersearch-dev-master-key}
+      MEILI_ENV: development
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile.dev
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+    environment:
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-hackersearch-dev-master-key}
+      # Depth of the initial backfill. Unset it (empty) to index the FULL corpus.
+      BACKFILL_RECENT: ${BACKFILL_RECENT:-100000}
+      INDEXER_STATE_FILE: /data/indexer-state.json
+    volumes:
+      - indexer_state:/data
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+    develop:
+      watch:
+        - action: sync
+          path: ./indexer/src
+          target: /app/src
+        - action: rebuild
+          path: ./indexer/Cargo.toml
+        - action: rebuild
+          path: ./indexer/Cargo.lock
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+    environment:
+      WATCHPACK_POLLING: "true"
+      # Must be reachable from the BROWSER. With OrbStack, the service DNS name
+      # works from the host; plain Docker users can switch to http://localhost:7701.
+      NEXT_PUBLIC_MEILISEARCH_HOST: ${NEXT_PUBLIC_MEILISEARCH_HOST:-http://localhost:7701}
+      NEXT_PUBLIC_MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-hackersearch-dev-master-key}
+    develop:
+      watch:
+        - action: sync
+          path: ./web/src
+          target: /app/src
+        - action: sync
+          path: ./web/public
+          target: /app/public
+        - action: rebuild
+          path: ./web/package.json
+
+volumes:
+  meili_data:
+  indexer_state:
+  cargo-registry:
+  cargo-git:
+  target-cache:

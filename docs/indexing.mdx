@@ -1,0 +1,80 @@
+---
+title: Indexing
+description: How the Rust indexer turns the HN Firebase API into a Meilisearch index.
+---
+
+## Data source
+
+The [official HN Firebase API](https://github.com/HackerNews/API) exposes every
+item ever created under sequential ids (`/v0/item/{id}.json`), the current
+`/v0/maxitem.json`, and recently changed ids under `/v0/updates.json`.
+
+## Commands
+
+```sh
+hn-indexer settings                # create the index + apply settings
+hn-indexer backfill [--recent N]   # maxitem → 1, or only the last N ids
+hn-indexer backfill --since-days N # everything posted in the last N days
+hn-indexer sync [--interval 30]    # follow new + updated items forever
+hn-indexer run [--recent N]        # settings + backfill + sync in one process
+```
+
+`--since-days` binary-searches the sequential id space for the item closest to
+the requested cutoff, then backfills from `maxitem` down to it.
+
+The backfill walks ids downward in chunks (default 2000 ids, 128 concurrent
+requests) and checkpoints progress to `indexer-state.json` after every chunk,
+so it can be interrupted and resumed at any time. Expect ~750 ids/s, which puts
+the full corpus at roughly 17 hours.
+
+## Document schema
+
+```json
+{
+  "id": 44251337,
+  "type": "story",
+  "tags": ["story", "show_hn"],
+  "title": "Show HN: ...",
+  "text": "Plain text, HTML stripped at index time",
+  "url": "https://example.com/post",
+  "domain": "example.com",
+  "author": "pg",
+  "points": 128,
+  "num_comments": 42,
+  "created_at": 1751896800,
+  "parent": null
+}
+```
+
+Deleted and dead items are skipped. `tags` powers the type facet and adds
+`ask_hn` / `show_hn` / `launch_hn` / `tell_hn` derived from title prefixes,
+mirroring the tag scheme HN Search users know.
+
+## Article enrichment (embeddings)
+
+`hn-indexer enrich` implements the [hackerverse](https://github.com/wilsonzlin/hackerverse)
+idea: fetch the page each story links to, strip non-primary HTML5 elements,
+and keep the main text (default 4,000 chars, `ENRICH_MAX_CHARS`). With
+`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` set (or `--extractor
+cloudflare`), pages are instead rendered in Cloudflare Browser Rendering's
+headless browser and returned as markdown — JS-heavy sites included — with
+the local extractor as automatic per-page fallback. The result
+is stored as `content` on the document plus an `enriched: true` marker so
+attempts (including failures) are never repeated. `content` is **not** a
+searchable attribute — it only feeds the embedder's document template:
+
+```
+{{ doc.type }}: {{ doc.title }} + content (or the item's own text for comments)
+```
+
+Enable an embedder afterwards with `settings --embedder huggingface` (local,
+keyless) or `--embedder openai` (needs `OPENAI_API_KEY`). Document upserts use
+HTTP `PUT` (add-or-update), so re-syncing an item never erases its enrichment.
+
+## Index settings
+
+- **searchableAttributes**: `title`, `text`, `url`, `domain`, `author`
+- **filterableAttributes**: `type`, `tags`, `author`, `domain`, `points`, `num_comments`, `created_at`, `parent`
+- **sortableAttributes**: `created_at`, `points`, `num_comments`
+- **rankingRules**: the defaults plus a final `points:desc` tiebreaker, so an
+  empty query degrades gracefully into a "top of HN" view
