@@ -58,6 +58,12 @@ export interface HNSearchResult {
   processingTimeMs: number;
   /** Full client-observed round-trip for the multi-search request. */
   roundTripMs: number;
+  /** The exact multi-search payload sent to Meilisearch, plus the engine
+   *  time of each query in the batch — powers the "query" detail panel. */
+  debug: {
+    request: { queries: unknown[] };
+    timings: { label: string; ms: number }[];
+  };
   facets: {
     tags: FacetCounts;
     domain: FacetCounts;
@@ -119,39 +125,38 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
     s.semantic && EMBEDDER && s.q && s.sort === "relevance"
       ? { hybrid: { embedder: EMBEDDER, semanticRatio: 0.6 } }
       : {};
-  const { results } = await meili.multiSearch({
-    queries: [
-      {
-        indexUid: INDEX_UID,
-        q: s.q,
-        ...hybrid,
-        filter: buildFilter(s),
-        sort: SORTS[s.sort],
-        hitsPerPage: HITS_PER_PAGE,
-        page: s.page,
-        attributesToHighlight: ["title", "text"],
-        highlightPreTag: HL_START,
-        highlightPostTag: HL_END,
-        attributesToCrop: ["text"],
-        cropLength: 45,
-      },
-      ...dimensions.map((dim) => ({
-        indexUid: INDEX_UID,
-        q: s.q,
-        filter: buildFilter(s, dim),
-        facets: [dim],
-        limit: 0,
-      })),
-      {
-        indexUid: INDEX_UID,
-        q: s.q,
-        filter: buildFilter(s),
-        sort: ["points:desc"],
-        limit: 5,
-        attributesToRetrieve: ["id", "title", "text"],
-      },
-    ],
-  });
+  const queries = [
+    {
+      indexUid: INDEX_UID,
+      q: s.q,
+      ...hybrid,
+      filter: buildFilter(s),
+      sort: SORTS[s.sort],
+      hitsPerPage: HITS_PER_PAGE,
+      page: s.page,
+      attributesToHighlight: ["title", "text"],
+      highlightPreTag: HL_START,
+      highlightPostTag: HL_END,
+      attributesToCrop: ["text"],
+      cropLength: 45,
+    },
+    ...dimensions.map((dim) => ({
+      indexUid: INDEX_UID,
+      q: s.q,
+      filter: buildFilter(s, dim),
+      facets: [dim],
+      limit: 0,
+    })),
+    {
+      indexUid: INDEX_UID,
+      q: s.q,
+      filter: buildFilter(s),
+      sort: ["points:desc"],
+      limit: 5,
+      attributesToRetrieve: ["id", "title", "text"],
+    },
+  ];
+  const { results } = await meili.multiSearch({ queries });
 
   const main = results[0];
   const facetFor = (i: number, dim: FilterDimension): FacetCounts =>
@@ -166,6 +171,15 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
     page: s.page,
     processingTimeMs: main.processingTimeMs,
     roundTripMs: Math.round(performance.now() - startedAt),
+    debug: {
+      request: { queries },
+      timings: results.map((r, i) => ({
+        label:
+          ["hits", "facets:tags", "facets:domain", "facets:author", "completion"][i] ??
+          `query ${i}`,
+        ms: r.processingTimeMs,
+      })),
+    },
     facets: {
       tags: facetFor(0, "tags"),
       domain: facetFor(1, "domain"),

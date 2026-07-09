@@ -1,7 +1,8 @@
 "use client";
 
 import type { UseQueryResult } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
+import { Braces, Check, ChevronLeft, ChevronRight, Copy, ServerCrash } from "lucide-react";
+import { useState } from "react";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import { MEILI_HOST, type HNSearchResult } from "@/lib/meili";
@@ -20,6 +21,7 @@ interface ResultsProps {
 
 export function Results({ search, state, indexEmpty, onPage, onState }: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
+  const [showDetail, setShowDetail] = useState(false);
 
   if (isError) {
     return (
@@ -85,10 +87,23 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
           {data.processingTimeMs} ms engine
           <span className="max-sm:hidden"> · {data.roundTripMs} ms wire</span>
         </span>
-        <span className="tabular-nums">
+        <span className="flex items-center gap-3 tabular-nums">
+          <button
+            onClick={() => setShowDetail((v) => !v)}
+            className={cn(
+              "flex items-center gap-1 transition-colors hover:text-primary",
+              showDetail && "text-primary",
+            )}
+            title="Show the Meilisearch query behind this search"
+          >
+            <Braces className="size-3" />
+            query
+          </button>
           page {data.page}/{data.totalPages.toLocaleString("en-US")}
         </span>
       </div>
+
+      {showDetail && <SearchDetail debug={data.debug} roundTripMs={data.roundTripMs} />}
 
       <div className={cn("transition-opacity", isFetching && "opacity-60")}>
         {data.hits.map((hit) => (
@@ -97,6 +112,49 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
       </div>
 
       <Pagination page={data.page} totalPages={data.totalPages} onPage={onPage} />
+    </div>
+  );
+}
+
+function SearchDetail({
+  debug,
+  roundTripMs,
+}: {
+  debug: HNSearchResult["debug"];
+  roundTripMs: number;
+}) {
+  const [copied, setCopied] = useState(false);
+  const payload = JSON.stringify(debug.request, null, 2);
+
+  return (
+    <div className="mt-3 border bg-card font-mono text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
+        <span className="text-muted-foreground">
+          POST /multi-search ·{" "}
+          {debug.timings.map((t, i) => (
+            <span key={t.label} className="tabular-nums">
+              {i > 0 && " · "}
+              {t.label} {t.ms}ms
+            </span>
+          ))}
+          <span className="tabular-nums"> · wire {roundTripMs}ms</span>
+        </span>
+        <button
+          onClick={() => {
+            navigator.clipboard.writeText(payload).then(() => {
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            });
+          }}
+          className="flex items-center gap-1 text-muted-foreground transition-colors hover:text-primary"
+        >
+          {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+          {copied ? "copied" : "copy"}
+        </button>
+      </div>
+      <pre className="max-h-80 overflow-auto p-3 leading-relaxed text-foreground/80">
+        {payload}
+      </pre>
     </div>
   );
 }
