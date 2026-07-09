@@ -1,8 +1,7 @@
 "use client";
 
 import type { UseQueryResult } from "@tanstack/react-query";
-import { Braces, Check, ChevronLeft, ChevronRight, Copy, ServerCrash } from "lucide-react";
-import { useState } from "react";
+import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import { MEILI_HOST, type HNSearchResult } from "@/lib/meili";
@@ -21,7 +20,6 @@ interface ResultsProps {
 
 export function Results({ search, state, indexEmpty, onPage, onState }: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
-  const [showDetail, setShowDetail] = useState(false);
 
   if (isError) {
     return (
@@ -87,23 +85,10 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
           {data.processingTimeMs} ms engine
           <span className="max-sm:hidden"> · {data.roundTripMs} ms wire</span>
         </span>
-        <span className="flex items-center gap-3 tabular-nums">
-          <button
-            onClick={() => setShowDetail((v) => !v)}
-            className={cn(
-              "flex items-center gap-1 transition-colors hover:text-primary",
-              showDetail && "text-primary",
-            )}
-            title="Show the Meilisearch query behind this search"
-          >
-            <Braces className="size-3" />
-            query
-          </button>
+        <span className="tabular-nums">
           page {data.page}/{data.totalPages.toLocaleString("en-US")}
         </span>
       </div>
-
-      {showDetail && <SearchDetail debug={data.debug} roundTripMs={data.roundTripMs} />}
 
       <div className={cn("transition-opacity", isFetching && "opacity-60")}>
         {data.hits.map((hit) => (
@@ -112,87 +97,6 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
       </div>
 
       <Pagination page={data.page} totalPages={data.totalPages} onPage={onPage} />
-    </div>
-  );
-}
-
-function SearchDetail({
-  debug,
-  roundTripMs,
-}: {
-  debug: HNSearchResult["debug"];
-  roundTripMs: number;
-}) {
-  const [copied, setCopied] = useState(false);
-  const payload = JSON.stringify(debug.request, null, 2);
-
-  return (
-    <div className="mt-3 border bg-card font-mono text-xs">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
-        <span className="text-muted-foreground">
-          POST /multi-search ·{" "}
-          {debug.timings.map((t, i) => (
-            <span key={t.label} className="tabular-nums">
-              {i > 0 && " · "}
-              {t.label} {t.ms}ms
-            </span>
-          ))}
-          <span className="tabular-nums"> · wire {roundTripMs}ms</span>
-        </span>
-        <button
-          onClick={() => {
-            navigator.clipboard.writeText(payload).then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            });
-          }}
-          className="flex items-center gap-1 text-muted-foreground transition-colors hover:text-primary"
-        >
-          {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
-          {copied ? "copied" : "copy"}
-        </button>
-      </div>
-      {debug.performanceDetails !== undefined && (
-        <div className="border-b px-3 py-2">
-          <h3 className="mb-1.5 text-[10px] font-semibold tracking-[0.2em] text-muted-foreground uppercase">
-            Performance details
-          </h3>
-          <PerformanceDetails details={debug.performanceDetails} />
-        </div>
-      )}
-      <pre className="max-h-80 overflow-auto p-3 leading-relaxed text-foreground/80">
-        {payload}
-      </pre>
-    </div>
-  );
-}
-
-/** Meilisearch returns a flat map of "step > sub-step" -> duration string;
- *  render step rows indented by their path depth. */
-function PerformanceDetails({ details }: { details: unknown }) {
-  if (typeof details !== "object" || details === null) {
-    return <pre className="text-foreground/80">{JSON.stringify(details)}</pre>;
-  }
-  return (
-    <div className="max-h-48 overflow-auto">
-      {Object.entries(details).map(([step, duration]) => {
-        const depth = step.split(" > ").length - 1;
-        const label = step.split(" > ").pop();
-        return (
-          <div key={step} className="flex justify-between gap-4">
-            <span
-              className="text-foreground/80"
-              style={{ paddingLeft: `${depth}rem` }}
-              title={step}
-            >
-              {label}
-            </span>
-            <span className="text-muted-foreground tabular-nums">
-              {String(duration)}
-            </span>
-          </div>
-        );
-      })}
     </div>
   );
 }

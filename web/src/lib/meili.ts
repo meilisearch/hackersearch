@@ -58,15 +58,6 @@ export interface HNSearchResult {
   processingTimeMs: number;
   /** Full client-observed round-trip for the multi-search request. */
   roundTripMs: number;
-  /** The exact multi-search payload sent to Meilisearch, plus the engine
-   *  time of each query in the batch — powers the "query" detail panel. */
-  debug: {
-    request: { queries: unknown[] };
-    timings: { label: string; ms: number }[];
-    /** Per-step timing breakdown of the main query, when the server
-     *  supports showPerformanceDetails (Meilisearch >= 1.48). */
-    performanceDetails?: unknown;
-  };
   facets: {
     tags: FacetCounts;
     domain: FacetCounts;
@@ -114,11 +105,6 @@ const SORTS: Record<SearchState["sort"], string[] | undefined> = {
   points: ["points:desc"],
 };
 
-// showPerformanceDetails (Meilisearch >= 1.48) returns a per-step timing
-// breakdown of the main query. Older servers reject unknown parameters, so
-// feature-detect once and stop asking after the first "Unknown field".
-let performanceDetailsSupported = true;
-
 /**
  * One round-trip: the main paginated query plus one facet-count query per
  * dimension with that dimension's own filter removed, so checking a value
@@ -136,12 +122,11 @@ export async function searchHN(
     s.semantic && EMBEDDER && s.q && s.sort === "relevance"
       ? { hybrid: { embedder: EMBEDDER, semanticRatio: 0.6 } }
       : {};
-  const buildQueries = (withPerfDetails: boolean) => [
+  const queries = [
     {
       indexUid: INDEX_UID,
       q: s.q,
       ...hybrid,
-      ...(withPerfDetails ? { showPerformanceDetails: true } : {}),
       filter: buildFilter(s),
       sort: SORTS[s.sort],
       hitsPerPage: HITS_PER_PAGE,
@@ -171,26 +156,7 @@ export async function searchHN(
 
   // The signal comes from TanStack Query: superseded searches (new
   // keystroke, changed filter) abort their in-flight HTTP request.
-  const run = (qs: ReturnType<typeof buildQueries>) =>
-    meili.multiSearch({ queries: qs }, { signal });
-  let queries = buildQueries(performanceDetailsSupported);
-  let response: Awaited<ReturnType<typeof run>>;
-  try {
-    response = await run(queries);
-  } catch (error) {
-    if (
-      performanceDetailsSupported &&
-      error instanceof Error &&
-      error.message.includes("showPerformanceDetails")
-    ) {
-      performanceDetailsSupported = false;
-      queries = buildQueries(false);
-      response = await run(queries);
-    } else {
-      throw error;
-    }
-  }
-  const { results } = response;
+  const { results } = await meili.multiSearch({ queries }, { signal });
 
   const main = results[0];
   const facetFor = (i: number, dim: FilterDimension): FacetCounts =>
@@ -205,17 +171,6 @@ export async function searchHN(
     page: s.page,
     processingTimeMs: main.processingTimeMs,
     roundTripMs: Math.round(performance.now() - startedAt),
-    debug: {
-      request: { queries },
-      timings: results.map((r, i) => ({
-        label:
-          ["hits", "facets:tags", "facets:domain", "facets:author", "completion"][i] ??
-          `query ${i}`,
-        ms: r.processingTimeMs,
-      })),
-      performanceDetails: (main as { performanceDetails?: unknown })
-        .performanceDetails,
-    },
     facets: {
       tags: facetFor(0, "tags"),
       domain: facetFor(1, "domain"),
