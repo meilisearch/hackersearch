@@ -199,7 +199,8 @@ function ValueFacet({
   const debouncedFacetQuery = useDebounced(facetQuery, 150);
   const facetSearch = useQuery({
     queryKey: ["facet-values", dim, debouncedFacetQuery, state],
-    queryFn: () => searchFacetValues(dim, debouncedFacetQuery, state),
+    queryFn: ({ signal }) =>
+      searchFacetValues(dim, debouncedFacetQuery, state, signal),
     enabled: debouncedFacetQuery.length > 0,
     placeholderData: keepPreviousData,
   });

@@ -9,7 +9,9 @@ import type { SearchState } from "@/lib/search-state";
 export function useHNSearch(state: SearchState) {
   return useQuery({
     queryKey: ["hn-search", state],
-    queryFn: () => searchHN(state),
+    // TanStack aborts the signal when this query is superseded, cancelling
+    // the previous in-flight request instead of letting it complete.
+    queryFn: ({ signal }) => searchHN(state, signal),
     placeholderData: keepPreviousData,
   });
 }

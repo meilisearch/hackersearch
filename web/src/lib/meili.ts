@@ -116,7 +116,10 @@ const SORTS: Record<SearchState["sort"], string[] | undefined> = {
  * dimension with that dimension's own filter removed, so checking a value
  * never zeroes out its siblings (disjunctive faceting).
  */
-export async function searchHN(s: SearchState): Promise<HNSearchResult> {
+export async function searchHN(
+  s: SearchState,
+  signal?: AbortSignal,
+): Promise<HNSearchResult> {
   const dimensions: FilterDimension[] = ["tags", "domain", "author"];
   const startedAt = performance.now();
   // Hybrid (keyword + vector) applies to the main query only; facet counts
@@ -156,7 +159,9 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
       attributesToRetrieve: ["id", "title", "text"],
     },
   ];
-  const { results } = await meili.multiSearch({ queries });
+  // The signal comes from TanStack Query: superseded searches (new
+  // keystroke, changed filter) abort their in-flight HTTP request.
+  const { results } = await meili.multiSearch({ queries }, { signal });
 
   const main = results[0];
   const facetFor = (i: number, dim: FilterDimension): FacetCounts =>
@@ -205,13 +210,17 @@ export async function searchFacetValues(
   dim: "domain" | "author",
   facetQuery: string,
   s: SearchState,
+  signal?: AbortSignal,
 ): Promise<FacetValueHit[]> {
-  const res = await meili.index(INDEX_UID).searchForFacetValues({
-    facetName: dim,
-    facetQuery,
-    q: s.q,
-    filter: buildFilter(s, dim),
-  });
+  const res = await meili.index(INDEX_UID).searchForFacetValues(
+    {
+      facetName: dim,
+      facetQuery,
+      q: s.q,
+      filter: buildFilter(s, dim),
+    },
+    { signal },
+  );
   // facet-search has no `limit` param — it's bounded only by the index's
   // faceting.maxValuesPerFacet (100), so truncate client-side instead.
   return res.facetHits.slice(0, MAX_FACET_ROWS);
