@@ -54,7 +54,10 @@ export interface HNSearchResult {
   totalHits: number;
   totalPages: number;
   page: number;
+  /** Engine-side time reported by Meilisearch for the main query. */
   processingTimeMs: number;
+  /** Full client-observed round-trip for the multi-search request. */
+  roundTripMs: number;
   facets: {
     tags: FacetCounts;
     domain: FacetCounts;
@@ -109,6 +112,7 @@ const SORTS: Record<SearchState["sort"], string[] | undefined> = {
  */
 export async function searchHN(s: SearchState): Promise<HNSearchResult> {
   const dimensions: FilterDimension[] = ["tags", "domain", "author"];
+  const startedAt = performance.now();
   // Hybrid (keyword + vector) applies to the main query only; facet counts
   // stay keyword-based. Meaningless without a query or under explicit sorts.
   const hybrid =
@@ -161,6 +165,7 @@ export async function searchHN(s: SearchState): Promise<HNSearchResult> {
     totalPages: "totalPages" in main ? (main.totalPages as number) : 1,
     page: s.page,
     processingTimeMs: main.processingTimeMs,
+    roundTripMs: Math.round(performance.now() - startedAt),
     facets: {
       tags: facetFor(0, "tags"),
       domain: facetFor(1, "domain"),

@@ -76,10 +76,14 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
           isFetching && "opacity-60",
         )}
       >
-        <span className="tabular-nums">
+        <span
+          className="tabular-nums"
+          title="engine = Meilisearch processing time · wire = full network round-trip"
+        >
           {data.totalHits.toLocaleString("en-US")}
           {data.totalHits === 10_000 ? "+" : ""} results ·{" "}
-          {data.processingTimeMs} ms
+          {data.processingTimeMs} ms engine
+          <span className="max-sm:hidden"> · {data.roundTripMs} ms wire</span>
         </span>
         <span className="tabular-nums">
           page {data.page}/{data.totalPages.toLocaleString("en-US")}
