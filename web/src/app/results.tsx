@@ -152,9 +152,47 @@ function SearchDetail({
           {copied ? "copied" : "copy"}
         </button>
       </div>
+      {debug.performanceDetails !== undefined && (
+        <div className="border-b px-3 py-2">
+          <h3 className="mb-1.5 text-[10px] font-semibold tracking-[0.2em] text-muted-foreground uppercase">
+            Performance details
+          </h3>
+          <PerformanceDetails details={debug.performanceDetails} />
+        </div>
+      )}
       <pre className="max-h-80 overflow-auto p-3 leading-relaxed text-foreground/80">
         {payload}
       </pre>
+    </div>
+  );
+}
+
+/** Meilisearch returns a flat map of "step > sub-step" -> duration string;
+ *  render step rows indented by their path depth. */
+function PerformanceDetails({ details }: { details: unknown }) {
+  if (typeof details !== "object" || details === null) {
+    return <pre className="text-foreground/80">{JSON.stringify(details)}</pre>;
+  }
+  return (
+    <div className="max-h-48 overflow-auto">
+      {Object.entries(details).map(([step, duration]) => {
+        const depth = step.split(" > ").length - 1;
+        const label = step.split(" > ").pop();
+        return (
+          <div key={step} className="flex justify-between gap-4">
+            <span
+              className="text-foreground/80"
+              style={{ paddingLeft: `${depth}rem` }}
+              title={step}
+            >
+              {label}
+            </span>
+            <span className="text-muted-foreground tabular-nums">
+              {String(duration)}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

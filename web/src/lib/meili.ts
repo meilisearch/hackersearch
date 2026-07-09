@@ -63,6 +63,9 @@ export interface HNSearchResult {
   debug: {
     request: { queries: unknown[] };
     timings: { label: string; ms: number }[];
+    /** Per-step timing breakdown of the main query, when the server
+     *  supports showPerformanceDetails (Meilisearch >= 1.48). */
+    performanceDetails?: unknown;
   };
   facets: {
     tags: FacetCounts;
@@ -111,6 +114,11 @@ const SORTS: Record<SearchState["sort"], string[] | undefined> = {
   points: ["points:desc"],
 };
 
+// showPerformanceDetails (Meilisearch >= 1.48) returns a per-step timing
+// breakdown of the main query. Older servers reject unknown parameters, so
+// feature-detect once and stop asking after the first "Unknown field".
+let performanceDetailsSupported = true;
+
 /**
  * One round-trip: the main paginated query plus one facet-count query per
  * dimension with that dimension's own filter removed, so checking a value
@@ -128,11 +136,12 @@ export async function searchHN(
     s.semantic && EMBEDDER && s.q && s.sort === "relevance"
       ? { hybrid: { embedder: EMBEDDER, semanticRatio: 0.6 } }
       : {};
-  const queries = [
+  const buildQueries = (withPerfDetails: boolean) => [
     {
       indexUid: INDEX_UID,
       q: s.q,
       ...hybrid,
+      ...(withPerfDetails ? { showPerformanceDetails: true } : {}),
       filter: buildFilter(s),
       sort: SORTS[s.sort],
       hitsPerPage: HITS_PER_PAGE,
@@ -159,9 +168,29 @@ export async function searchHN(
       attributesToRetrieve: ["id", "title", "text"],
     },
   ];
+
   // The signal comes from TanStack Query: superseded searches (new
   // keystroke, changed filter) abort their in-flight HTTP request.
-  const { results } = await meili.multiSearch({ queries }, { signal });
+  const run = (qs: ReturnType<typeof buildQueries>) =>
+    meili.multiSearch({ queries: qs }, { signal });
+  let queries = buildQueries(performanceDetailsSupported);
+  let response: Awaited<ReturnType<typeof run>>;
+  try {
+    response = await run(queries);
+  } catch (error) {
+    if (
+      performanceDetailsSupported &&
+      error instanceof Error &&
+      error.message.includes("showPerformanceDetails")
+    ) {
+      performanceDetailsSupported = false;
+      queries = buildQueries(false);
+      response = await run(queries);
+    } else {
+      throw error;
+    }
+  }
+  const { results } = response;
 
   const main = results[0];
   const facetFor = (i: number, dim: FilterDimension): FacetCounts =>
@@ -184,6 +213,8 @@ export async function searchHN(
           `query ${i}`,
         ms: r.processingTimeMs,
       })),
+      performanceDetails: (main as { performanceDetails?: unknown })
+        .performanceDetails,
     },
     facets: {
       tags: facetFor(0, "tags"),
