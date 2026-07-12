@@ -15,10 +15,18 @@ interface ResultsProps {
   state: SearchState;
   indexEmpty: boolean;
   onPage: (page: number) => void;
+  onPrefetchPage: (page: number) => void;
   onState: (patch: Partial<SearchState>) => void;
 }
 
-export function Results({ search, state, indexEmpty, onPage, onState }: ResultsProps) {
+export function Results({
+  search,
+  state,
+  indexEmpty,
+  onPage,
+  onPrefetchPage,
+  onState,
+}: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
 
   if (isError) {
@@ -92,11 +100,22 @@ export function Results({ search, state, indexEmpty, onPage, onState }: ResultsP
 
       <div className={cn("transition-opacity", isFetching && "opacity-60")}>
         {data.hits.map((hit) => (
-          <HitCard key={hit.id} hit={hit} state={state} onState={onState} />
+          <HitCard
+            key={hit.id}
+            hit={hit}
+            domains={state.domains}
+            authors={state.authors}
+            onState={onState}
+          />
         ))}
       </div>
 
-      <Pagination page={data.page} totalPages={data.totalPages} onPage={onPage} />
+      <Pagination
+        page={data.page}
+        totalPages={data.totalPages}
+        onPage={onPage}
+        onPrefetchPage={onPrefetchPage}
+      />
     </div>
   );
 }
@@ -125,30 +144,39 @@ function Pagination({
   page,
   totalPages,
   onPage,
+  onPrefetchPage,
 }: {
   page: number;
   totalPages: number;
   onPage: (page: number) => void;
+  onPrefetchPage: (page: number) => void;
 }) {
   if (totalPages <= 1) return null;
 
   const windowPages = [page - 2, page - 1, page, page + 1, page + 2].filter(
     (p) => p >= 1 && p <= totalPages,
   );
+  // Common next move — warm it eagerly so the arrow feels instant.
+  if (page < totalPages) onPrefetchPage(page + 1);
+
+  const go = (p: number) => ({
+    onClick: () => onPage(p),
+    onPrefetch: () => onPrefetchPage(p),
+  });
 
   return (
     <nav className="flex items-center justify-center gap-1 py-6 font-mono text-xs">
-      <PageButton disabled={page === 1} onClick={() => onPage(page - 1)}>
+      <PageButton disabled={page === 1} {...go(page - 1)}>
         <ChevronLeft className="size-3.5" />
       </PageButton>
       {windowPages[0] > 1 && (
         <>
-          <PageButton onClick={() => onPage(1)}>1</PageButton>
+          <PageButton {...go(1)}>1</PageButton>
           {windowPages[0] > 2 && <span className="px-1 text-muted-foreground">…</span>}
         </>
       )}
       {windowPages.map((p) => (
-        <PageButton key={p} active={p === page} onClick={() => onPage(p)}>
+        <PageButton key={p} active={p === page} {...go(p)}>
           {p}
         </PageButton>
       ))}
@@ -157,12 +185,10 @@ function Pagination({
           {windowPages[windowPages.length - 1] < totalPages - 1 && (
             <span className="px-1 text-muted-foreground">…</span>
           )}
-          <PageButton onClick={() => onPage(totalPages)}>
-            {totalPages}
-          </PageButton>
+          <PageButton {...go(totalPages)}>{totalPages}</PageButton>
         </>
       )}
-      <PageButton disabled={page === totalPages} onClick={() => onPage(page + 1)}>
+      <PageButton disabled={page === totalPages} {...go(page + 1)}>
         <ChevronRight className="size-3.5" />
       </PageButton>
     </nav>
@@ -172,17 +198,21 @@ function Pagination({
 function PageButton({
   children,
   onClick,
+  onPrefetch,
   active,
   disabled,
 }: {
   children: React.ReactNode;
   onClick: () => void;
+  onPrefetch?: () => void;
   active?: boolean;
   disabled?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
+      onMouseEnter={disabled ? undefined : onPrefetch}
+      onFocus={disabled ? undefined : onPrefetch}
       disabled={disabled}
       className={cn(
         // min-w keeps 1-2 digit pages square; longer numbers grow via padding.

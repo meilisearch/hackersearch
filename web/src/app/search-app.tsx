@@ -8,6 +8,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -20,7 +21,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
-import { EMBEDDER } from "@/lib/meili";
+import { EMBEDDER, searchHN } from "@/lib/meili";
 import { useDebounced, useHNSearch, useIndexStats } from "@/hooks/use-hn-search";
 import {
   hasActiveFilters,
@@ -100,6 +101,21 @@ export function SearchApp() {
   );
   const search = useHNSearch(queryState);
   const stats = useIndexStats();
+
+  // Warm a page's results on hover so clicking it paints instantly. The key
+  // must match useHNSearch's exactly, so it's built from the same queryState.
+  const queryClient = useQueryClient();
+  const prefetchPage = useCallback(
+    (page: number) => {
+      const target = { ...queryState, page };
+      queryClient.prefetchQuery({
+        queryKey: ["hn-search", target],
+        queryFn: ({ signal }) => searchHN(target, signal),
+        staleTime: 30_000,
+      });
+    },
+    [queryClient, queryState],
+  );
 
   // Ghost suffix completing the word being typed, accepted with Tab / →.
   // Long queries scroll inside the input and the overlay wouldn't track,
@@ -345,6 +361,7 @@ export function SearchApp() {
               update({ page });
               window.scrollTo({ top: 0 });
             }}
+            onPrefetchPage={prefetchPage}
             onState={update}
           />
         </section>

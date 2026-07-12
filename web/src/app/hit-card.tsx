@@ -2,6 +2,7 @@
 
 import { formatDistanceToNowStrict } from "date-fns";
 import { ArrowUpRight, MessageSquare, TriangleAlert } from "lucide-react";
+import { memo } from "react";
 
 import { hnItemUrl, type HNHit } from "@/lib/meili";
 import type { SearchState } from "@/lib/search-state";
@@ -23,10 +24,19 @@ const TAG_LABELS: Record<string, string> = {
 interface HitCardProps {
   hit: HNHit;
   onState: (patch: Partial<SearchState>) => void;
-  state: SearchState;
+  // Only the two arrays this card reads, not the whole SearchState — their
+  // references stay stable while typing (q changes don't touch them), so the
+  // memo below actually skips re-rendering the list on every keystroke.
+  domains: string[];
+  authors: string[];
 }
 
-export function HitCard({ hit, onState, state }: HitCardProps) {
+export const HitCard = memo(function HitCard({
+  hit,
+  onState,
+  domains,
+  authors,
+}: HitCardProps) {
   const isComment = hit.type === "comment";
   const timeAgo = hit.created_at
     ? formatDistanceToNowStrict(new Date(hit.created_at * 1000), {
@@ -68,9 +78,9 @@ export function HitCard({ hit, onState, state }: HitCardProps) {
             <button
               onClick={() =>
                 onState({
-                  domains: state.domains.includes(hit.domain!)
-                    ? state.domains
-                    : [...state.domains, hit.domain!],
+                  domains: domains.includes(hit.domain!)
+                    ? domains
+                    : [...domains, hit.domain!],
                 })
               }
               className="ml-2 align-baseline font-mono text-xs font-normal text-muted-foreground hover:text-primary hover:underline"
@@ -112,9 +122,9 @@ export function HitCard({ hit, onState, state }: HitCardProps) {
           <button
             onClick={() =>
               onState({
-                authors: state.authors.includes(hit.author)
-                  ? state.authors
-                  : [...state.authors, hit.author],
+                authors: authors.includes(hit.author)
+                  ? authors
+                  : [...authors, hit.author],
               })
             }
             className="hover:text-primary hover:underline"
@@ -136,4 +146,4 @@ export function HitCard({ hit, onState, state }: HitCardProps) {
       </div>
     </article>
   );
-}
+});

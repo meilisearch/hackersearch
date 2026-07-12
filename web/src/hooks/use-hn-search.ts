@@ -25,8 +25,10 @@ export function useIndexStats() {
   });
 }
 
-/** Debounce fast-changing values (the query string) before they hit the network. */
-export function useDebounced<T>(value: T, delayMs = 150): T {
+/** Debounce fast-changing values (the query string) before they hit the
+ *  network. 100ms keeps keystrokes snappy while still collapsing bursts;
+ *  superseded requests abort, so a tight interval is cheap. */
+export function useDebounced<T>(value: T, delayMs = 100): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(value), delayMs);
