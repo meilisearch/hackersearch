@@ -183,10 +183,15 @@ export async function searchHN(
             indexUid: INDEX_UID,
             q: s.q,
             ...perfParam(),
-            filter: buildFilter(s),
+            // Complete only from story titles: match the title field alone,
+            // restrict to posts (comments/poll options have no title), and
+            // take just the single highest-pointed match — the ghost only
+            // ever uses the top one.
+            attributesToSearchOn: ["title"],
+            filter: 'type != "comment"',
             sort: ["points:desc"],
-            limit: 5,
-            attributesToRetrieve: ["id", "title", "text"],
+            limit: 1,
+            attributesToRetrieve: ["title"],
           },
         ]
       : []),
