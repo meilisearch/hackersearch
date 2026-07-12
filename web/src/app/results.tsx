@@ -156,8 +156,6 @@ function Pagination({
   const windowPages = [page - 2, page - 1, page, page + 1, page + 2].filter(
     (p) => p >= 1 && p <= totalPages,
   );
-  // Common next move — warm it eagerly so the arrow feels instant.
-  if (page < totalPages) onPrefetchPage(page + 1);
 
   const go = (p: number) => ({
     onClick: () => onPage(p),
