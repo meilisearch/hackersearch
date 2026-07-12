@@ -22,7 +22,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { EMBEDDER, searchHN } from "@/lib/meili";
-import { useDebounced, useHNSearch, useIndexStats } from "@/hooks/use-hn-search";
+import { useDebounced, useHNSearch } from "@/hooks/use-hn-search";
 import {
   hasActiveFilters,
   paramsToState,
@@ -100,7 +100,6 @@ export function SearchApp() {
     [state, debouncedQ],
   );
   const search = useHNSearch(queryState);
-  const stats = useIndexStats();
 
   // Warm a page's results on hover so clicking it paints instantly. The key
   // must match useHNSearch's exactly, so it's built from the same queryState.
@@ -170,23 +169,14 @@ export function SearchApp() {
               </span>
             </div>
             <div className="font-mono text-xs text-muted-foreground">
-              {stats.data ? (
-                <span>
-                  {stats.data.numberOfDocuments.toLocaleString("en-US")} docs
-                  {stats.data.isIndexing && (
-                    <span className="text-primary"> · indexing…</span>
-                  )}
-                </span>
-              ) : (
-                <a
-                  href="https://www.meilisearch.com"
-                  className="hover:text-primary"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  meilisearch
-                </a>
-              )}
+              <a
+                href="https://www.meilisearch.com"
+                className="hover:text-primary"
+                target="_blank"
+                rel="noreferrer"
+              >
+                meilisearch
+              </a>
             </div>
           </div>
 
@@ -356,7 +346,6 @@ export function SearchApp() {
           <Results
             search={search}
             state={state}
-            indexEmpty={stats.data?.numberOfDocuments === 0}
             onPage={(page) => {
               update({ page });
               window.scrollTo({ top: 0 });

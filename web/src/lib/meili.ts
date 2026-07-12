@@ -273,19 +273,6 @@ export async function searchFacetValues(
   return res.facetHits.slice(0, MAX_FACET_ROWS);
 }
 
-export interface IndexStats {
-  numberOfDocuments: number;
-  isIndexing: boolean;
-}
-
-export async function fetchIndexStats(): Promise<IndexStats> {
-  const stats = await meili.index(INDEX_UID).getStats();
-  return {
-    numberOfDocuments: stats.numberOfDocuments,
-    isIndexing: stats.isIndexing,
-  };
-}
-
 export function hnItemUrl(id: number): string {
   return `https://news.ycombinator.com/item?id=${id}`;
 }

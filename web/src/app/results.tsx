@@ -5,7 +5,7 @@ import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import { MEILI_HOST, type HNSearchResult } from "@/lib/meili";
-import type { SearchState } from "@/lib/search-state";
+import { hasActiveFilters, type SearchState } from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 import { HitCard } from "./hit-card";
@@ -13,7 +13,6 @@ import { HitCard } from "./hit-card";
 interface ResultsProps {
   search: UseQueryResult<HNSearchResult, Error>;
   state: SearchState;
-  indexEmpty: boolean;
   onPage: (page: number) => void;
   onPrefetchPage: (page: number) => void;
   onState: (patch: Partial<SearchState>) => void;
@@ -22,7 +21,6 @@ interface ResultsProps {
 export function Results({
   search,
   state,
-  indexEmpty,
   onPage,
   onPrefetchPage,
   onState,
@@ -54,7 +52,9 @@ export function Results({
     );
   }
 
-  if (data.totalHits === 0 && indexEmpty) {
+  // With no query and no filters, zero hits means the index itself is empty
+  // (rather than a query that simply matched nothing).
+  if (data.totalHits === 0 && !state.q && !hasActiveFilters(state)) {
     return (
       <Notice title="The index is empty">
         <p>Start the indexer to pull Hacker News into Meilisearch:</p>

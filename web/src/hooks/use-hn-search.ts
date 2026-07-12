@@ -3,7 +3,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { fetchIndexStats, searchHN } from "@/lib/meili";
+import { searchHN } from "@/lib/meili";
 import type { SearchState } from "@/lib/search-state";
 
 export function useHNSearch(state: SearchState) {
@@ -13,15 +13,6 @@ export function useHNSearch(state: SearchState) {
     // the previous in-flight request instead of letting it complete.
     queryFn: ({ signal }) => searchHN(state, signal),
     placeholderData: keepPreviousData,
-  });
-}
-
-export function useIndexStats() {
-  return useQuery({
-    queryKey: ["hn-stats"],
-    queryFn: fetchIndexStats,
-    refetchInterval: 15_000,
-    retry: false,
   });
 }
 
