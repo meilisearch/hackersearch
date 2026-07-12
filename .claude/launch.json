@@ -8,6 +8,7 @@
       "env": {
         "PATH": "/Users/quentindequelen/.nvm/versions/node/v24.8.0/bin:/opt/homebrew/bin:/usr/bin:/bin"
       },
+      "autoPort": true,
       "port": 3000
     }
   ]

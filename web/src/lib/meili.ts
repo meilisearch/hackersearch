@@ -105,10 +105,22 @@ const SORTS: Record<SearchState["sort"], string[] | undefined> = {
   points: ["points:desc"],
 };
 
+const DIMENSION_SELECTION: Record<FilterDimension, (s: SearchState) => number> = {
+  tags: (s) => s.tags.length,
+  domain: (s) => s.domains.length,
+  author: (s) => s.authors.length,
+};
+
 /**
- * One round-trip: the main paginated query plus one facet-count query per
- * dimension with that dimension's own filter removed, so checking a value
- * never zeroes out its siblings (disjunctive faceting).
+ * One round-trip batching, at most:
+ *   1. the main paginated query (also carrying every facet's counts);
+ *   2. one facet-count query per dimension that has an ACTIVE selection,
+ *      with that dimension's own filter removed (disjunctive faceting);
+ *   3. a points-sorted query feeding the inline ghost completion.
+ *
+ * A dimension without a selection reads its counts straight off the main
+ * query, and (2)/(3) are omitted when not needed — so the common "typing a
+ * fresh query, no facets checked" case sends 1 query instead of 5.
  */
 export async function searchHN(
   s: SearchState,
@@ -122,6 +134,16 @@ export async function searchHN(
     s.semantic && EMBEDDER && s.q && s.sort === "relevance"
       ? { hybrid: { embedder: EMBEDDER, semanticRatio: 0.6 } }
       : {};
+
+  // Only dimensions with an active selection need their own exclusion query;
+  // for the rest the main query's own distribution is already correct.
+  const activeDims = dimensions.filter((d) => DIMENSION_SELECTION[d](s) > 0);
+
+  // Skip the completion query unless a ghost suffix could actually render
+  // (mirrors findCompletion's rules + the 40-char cap in search-app).
+  const lastWord = s.q.split(/\s+/).pop() ?? "";
+  const wantCompletion = s.q.length <= 40 && lastWord.length >= 2;
+
   const queries = [
     {
       indexUid: INDEX_UID,
@@ -131,27 +153,32 @@ export async function searchHN(
       sort: SORTS[s.sort],
       hitsPerPage: HITS_PER_PAGE,
       page: s.page,
+      facets: dimensions,
       attributesToHighlight: ["title", "text"],
       highlightPreTag: HL_START,
       highlightPostTag: HL_END,
       attributesToCrop: ["text"],
       cropLength: 45,
     },
-    ...dimensions.map((dim) => ({
+    ...activeDims.map((dim) => ({
       indexUid: INDEX_UID,
       q: s.q,
       filter: buildFilter(s, dim),
       facets: [dim],
       limit: 0,
     })),
-    {
-      indexUid: INDEX_UID,
-      q: s.q,
-      filter: buildFilter(s),
-      sort: ["points:desc"],
-      limit: 5,
-      attributesToRetrieve: ["id", "title", "text"],
-    },
+    ...(wantCompletion
+      ? [
+          {
+            indexUid: INDEX_UID,
+            q: s.q,
+            filter: buildFilter(s),
+            sort: ["points:desc"],
+            limit: 5,
+            attributesToRetrieve: ["id", "title", "text"],
+          },
+        ]
+      : []),
   ];
 
   // The signal comes from TanStack Query: superseded searches (new
@@ -159,12 +186,24 @@ export async function searchHN(
   const { results } = await meili.multiSearch({ queries }, { signal });
 
   const main = results[0];
-  const facetFor = (i: number, dim: FilterDimension): FacetCounts =>
-    (results[i + 1]?.facetDistribution?.[dim] as FacetCounts | undefined) ?? {};
+  const mainFacets = (main.facetDistribution ?? {}) as Record<string, FacetCounts>;
+  const excluded = new Map<FilterDimension, FacetCounts>();
+  activeDims.forEach((dim, i) => {
+    excluded.set(
+      dim,
+      (results[1 + i]?.facetDistribution?.[dim] as FacetCounts | undefined) ?? {},
+    );
+  });
+  const facetFor = (dim: FilterDimension): FacetCounts =>
+    excluded.get(dim) ?? mainFacets[dim] ?? {};
+
+  const completionHits = wantCompletion
+    ? ((results[1 + activeDims.length]?.hits as HNHit[]) ?? [])
+    : [];
 
   return {
     hits: (main.hits as HNHit[]) ?? [],
-    completionHits: (results[4]?.hits as HNHit[]) ?? [],
+    completionHits,
     totalHits:
       "totalHits" in main ? (main.totalHits as number) : main.hits.length,
     totalPages: "totalPages" in main ? (main.totalPages as number) : 1,
@@ -172,9 +211,9 @@ export async function searchHN(
     processingTimeMs: main.processingTimeMs,
     roundTripMs: Math.round(performance.now() - startedAt),
     facets: {
-      tags: facetFor(0, "tags"),
-      domain: facetFor(1, "domain"),
-      author: facetFor(2, "author"),
+      tags: facetFor("tags"),
+      domain: facetFor("domain"),
+      author: facetFor("author"),
     },
   };
 }
