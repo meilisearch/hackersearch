@@ -111,6 +111,14 @@ const DIMENSION_SELECTION: Record<FilterDimension, (s: SearchState) => number> =
   author: (s) => s.authors.length,
 };
 
+// Ask Meilisearch for its per-step timing breakdown on every request.
+// Servers older than ~1.48 reject unknown search parameters, so the first
+// "Unknown field" response flips this off and the request is retried plain.
+let performanceDetails = true;
+const perfParam = () => (performanceDetails ? { showPerformanceDetails: true } : {});
+const isUnknownPerfParam = (error: unknown) =>
+  error instanceof Error && error.message.includes("showPerformanceDetails");
+
 /**
  * One round-trip batching, at most:
  *   1. the main paginated query (also carrying every facet's counts);
@@ -144,11 +152,12 @@ export async function searchHN(
   const lastWord = s.q.split(/\s+/).pop() ?? "";
   const wantCompletion = s.q.length <= 40 && lastWord.length >= 2;
 
-  const queries = [
+  const buildQueries = () => [
     {
       indexUid: INDEX_UID,
       q: s.q,
       ...hybrid,
+      ...perfParam(),
       filter: buildFilter(s),
       sort: SORTS[s.sort],
       hitsPerPage: HITS_PER_PAGE,
@@ -163,6 +172,7 @@ export async function searchHN(
     ...activeDims.map((dim) => ({
       indexUid: INDEX_UID,
       q: s.q,
+      ...perfParam(),
       filter: buildFilter(s, dim),
       facets: [dim],
       limit: 0,
@@ -172,6 +182,7 @@ export async function searchHN(
           {
             indexUid: INDEX_UID,
             q: s.q,
+            ...perfParam(),
             filter: buildFilter(s),
             sort: ["points:desc"],
             limit: 5,
@@ -183,7 +194,17 @@ export async function searchHN(
 
   // The signal comes from TanStack Query: superseded searches (new
   // keystroke, changed filter) abort their in-flight HTTP request.
-  const { results } = await meili.multiSearch({ queries }, { signal });
+  let results;
+  try {
+    ({ results } = await meili.multiSearch({ queries: buildQueries() }, { signal }));
+  } catch (error) {
+    if (performanceDetails && isUnknownPerfParam(error)) {
+      performanceDetails = false; // older server; drop the param and retry
+      ({ results } = await meili.multiSearch({ queries: buildQueries() }, { signal }));
+    } else {
+      throw error;
+    }
+  }
 
   const main = results[0];
   const mainFacets = (main.facetDistribution ?? {}) as Record<string, FacetCounts>;
@@ -242,6 +263,7 @@ export async function searchFacetValues(
       facetName: dim,
       facetQuery,
       q: s.q,
+      ...perfParam(),
       filter: buildFilter(s, dim),
     },
     { signal },
