@@ -8,9 +8,9 @@ import {
 import { useEffect, useState } from "react";
 
 import { searchHN } from "@/lib/meili";
-import type { SearchState } from "@/lib/search-state";
+import type { SearchRequest } from "@/lib/search-state";
 
-export function useHNSearch(state: SearchState) {
+export function useHNSearch(state: SearchRequest) {
   const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: ["hn-search", state],

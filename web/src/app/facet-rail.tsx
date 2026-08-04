@@ -1,7 +1,7 @@
 "use client";
 
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { Search, X } from "lucide-react";
+import { ChevronRight, Search, X } from "lucide-react";
 import { useState } from "react";
 
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,12 +17,16 @@ import {
   POINTS_OPTIONS,
   TAG_OPTIONS,
   type SearchState,
+  type ValueFacetDim,
 } from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 interface FacetRailProps {
   state: SearchState;
   facets: HNSearchResult["facets"] | undefined;
+  /** Dimensions currently expanded — the only ones with computed counts. */
+  openFacets: ValueFacetDim[];
+  onToggleFacet: (dim: ValueFacetDim) => void;
   onChange: (patch: Partial<SearchState>) => void;
   onReset: () => void;
   showReset: boolean;
@@ -34,19 +38,67 @@ function toggle(list: string[], value: string): string[] {
     : [...list, value];
 }
 
+const HEADING =
+  "font-mono text-[10px] font-semibold tracking-[0.2em] text-muted-foreground uppercase";
+
+/**
+ * Static by default. Pass `onToggle` to make the heading an expander — used by
+ * the domain/author facets, whose counts are only computed while expanded.
+ * `locked` keeps a section with active selections open (its checked values
+ * have to stay visible); the toggle is then inert but still shows why.
+ */
 function Section({
   title,
+  open,
+  locked,
+  onToggle,
   children,
 }: {
   title: string;
+  open?: boolean;
+  locked?: boolean;
+  onToggle?: () => void;
   children: React.ReactNode;
 }) {
+  if (!onToggle) {
+    return (
+      <section className="border-b pb-4">
+        <h3 className={cn("mb-2.5", HEADING)}>{title}</h3>
+        {children}
+      </section>
+    );
+  }
   return (
     <section className="border-b pb-4">
-      <h3 className="mb-2.5 font-mono text-[10px] font-semibold tracking-[0.2em] text-muted-foreground uppercase">
-        {title}
+      <h3>
+        <button
+          onClick={onToggle}
+          disabled={locked}
+          aria-expanded={open}
+          title={
+            locked
+              ? `Clear the ${title.toLowerCase()} filter to collapse`
+              : open
+                ? `Collapse ${title.toLowerCase()} (stops computing its counts)`
+                : `Expand ${title.toLowerCase()}`
+          }
+          className={cn(
+            "mb-2.5 flex w-full items-center gap-1 transition-colors",
+            HEADING,
+            locked ? "cursor-not-allowed" : "hover:text-foreground",
+          )}
+        >
+          <ChevronRight
+            className={cn(
+              "size-3 shrink-0 transition-transform",
+              open && "rotate-90",
+              locked && "opacity-40",
+            )}
+          />
+          {title}
+        </button>
       </h3>
-      {children}
+      {open && children}
     </section>
   );
 }
@@ -57,6 +109,8 @@ const count = (n: number | undefined) =>
 export function FacetRail({
   state,
   facets,
+  openFacets,
+  onToggleFacet,
   onChange,
   onReset,
   showReset,
@@ -153,6 +207,8 @@ export function FacetRail({
           state={state}
           selected={state.domains}
           distribution={facets?.domain}
+          open={openFacets.includes("domain")}
+          onToggleOpen={() => onToggleFacet("domain")}
           onToggle={(value) =>
             onChange({ domains: toggle(state.domains, value) })
           }
@@ -165,6 +221,8 @@ export function FacetRail({
         state={state}
         selected={state.authors}
         distribution={facets?.author}
+        open={openFacets.includes("author")}
+        onToggleOpen={() => onToggleFacet("author")}
         onToggle={(value) => onChange({ authors: toggle(state.authors, value) })}
       />
 
@@ -186,13 +244,17 @@ function ValueFacet({
   state,
   selected,
   distribution,
+  open,
+  onToggleOpen,
   onToggle,
 }: {
   title: string;
-  dim: "domain" | "author";
+  dim: ValueFacetDim;
   state: SearchState;
   selected: string[];
   distribution: FacetCounts | undefined;
+  open: boolean;
+  onToggleOpen: () => void;
   onToggle: (value: string) => void;
 }) {
   const [facetQuery, setFacetQuery] = useState("");
@@ -201,11 +263,13 @@ function ValueFacet({
     queryKey: ["facet-values", dim, debouncedFacetQuery, state],
     queryFn: ({ signal }) =>
       searchFacetValues(dim, debouncedFacetQuery, state, signal),
-    enabled: debouncedFacetQuery.length > 0,
+    // Collapsing hides the search box, but a stale query string would keep this
+    // firing — gate on `open` so a closed section costs nothing at all.
+    enabled: open && debouncedFacetQuery.length > 0,
     placeholderData: keepPreviousData,
   });
 
-  const searching = facetQuery.length > 0;
+  const searching = open && facetQuery.length > 0;
   const top = Object.entries(distribution ?? {})
     .sort((a, b) => b[1] - a[1])
     .slice(0, MAX_FACET_ROWS);
@@ -221,10 +285,18 @@ function ValueFacet({
           .map((v) => [v, distribution?.[v]] as const),
         ...top,
       ].slice(0, MAX_FACET_ROWS);
-  if (rows.length === 0 && !searching) return null;
 
   return (
-    <Section title={title}>
+    // The header always renders: it's the only way to expand the section, and
+    // hiding it on an empty distribution would make the expander vanish while
+    // collapsed — and flicker out during the ~10ms it takes the newly-requested
+    // counts to arrive. `locked` because selections force it open.
+    <Section
+      title={title}
+      open={open}
+      locked={selected.length > 0}
+      onToggle={onToggleOpen}
+    >
       <div className="relative mb-2">
         <Search className="pointer-events-none absolute top-1/2 left-2 size-3 -translate-y-1/2 text-muted-foreground" />
         <input
