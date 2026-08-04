@@ -1,6 +1,10 @@
 import { Meilisearch } from "meilisearch";
 
-import { DATE_RANGES, type SearchState } from "./search-state";
+import {
+  DATE_RANGES,
+  type SearchRequest,
+  type SearchState,
+} from "./search-state";
 
 export const MEILI_HOST =
   process.env.NEXT_PUBLIC_MEILISEARCH_HOST ?? "http://localhost:7700";
@@ -121,9 +125,10 @@ const isUnknownPerfParam = (error: unknown) =>
 
 /**
  * One round-trip batching, at most:
- *   1. the main paginated query (also carrying every facet's counts);
- *   2. one facet-count query per dimension that has an ACTIVE selection,
- *      with that dimension's own filter removed (disjunctive faceting);
+ *   1. the main paginated query (also carrying every computed facet's counts);
+ *   2. one facet-count query per computed dimension that has an ACTIVE
+ *      selection, with that dimension's own filter removed (disjunctive
+ *      faceting);
  *   3. a points-sorted query feeding the inline ghost completion.
  *
  * A dimension without a selection reads its counts straight off the main
@@ -131,10 +136,17 @@ const isUnknownPerfParam = (error: unknown) =>
  * fresh query, no facets checked" case sends 1 query instead of 5.
  */
 export async function searchHN(
-  s: SearchState,
+  s: SearchRequest,
   signal?: AbortSignal,
 ): Promise<HNSearchResult> {
-  const dimensions: FilterDimension[] = ["tags", "domain", "author"];
+  // Only compute facets something will actually render. `tags` is 7
+  // low-cardinality values but only the News tab shows them; `domain` and
+  // `author` span the whole corpus, so they cost real time and are computed
+  // only while their rail section is expanded.
+  const dimensions: FilterDimension[] = [
+    ...(s.scope === "comments" ? [] : (["tags"] as const)),
+    ...s.openFacets,
+  ];
   const startedAt = performance.now();
   // Hybrid (keyword + vector) applies to the main query only; facet counts
   // stay keyword-based. Meaningless without a query or under explicit sorts.
@@ -162,7 +174,8 @@ export async function searchHN(
       sort: SORTS[s.sort],
       hitsPerPage: HITS_PER_PAGE,
       page: s.page,
-      facets: dimensions,
+      // Omitted entirely rather than sent empty when nothing needs counts.
+      ...(dimensions.length ? { facets: dimensions } : {}),
       attributesToHighlight: ["title", "text"],
       highlightPreTag: HL_START,
       highlightPostTag: HL_END,

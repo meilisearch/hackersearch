@@ -22,6 +22,9 @@ export type DateRange = (typeof DATE_RANGES)[number]["value"];
 export type SortKey = "relevance" | "date" | "points";
 export type Scope = "news" | "comments";
 
+/** The two high-cardinality facets whose rail sections collapse. */
+export type ValueFacetDim = "domain" | "author";
+
 export interface SearchState {
   scope: Scope;
   semantic: boolean;
@@ -33,6 +36,16 @@ export interface SearchState {
   minPoints: number;
   sort: SortKey;
   page: number;
+}
+
+/**
+ * What actually goes to Meilisearch: the shareable state plus which
+ * high-cardinality facets to compute counts for. Openness shapes the request
+ * but is a local preference rather than shareable state, so it lives here and
+ * never reaches stateToParams / paramsToState / hasActiveFilters.
+ */
+export interface SearchRequest extends SearchState {
+  openFacets: ValueFacetDim[];
 }
 
 export const DEFAULT_STATE: SearchState = {

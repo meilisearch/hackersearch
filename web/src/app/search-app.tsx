@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/sheet";
 import { EMBEDDER, searchHN } from "@/lib/meili";
 import { useDebounced, useHNSearch } from "@/hooks/use-hn-search";
+import { useOpenFacets } from "@/hooks/use-open-facets";
 import {
   hasActiveFilters,
   paramsToState,
@@ -30,6 +31,7 @@ import {
   type Scope,
   type SearchState,
   type SortKey,
+  type ValueFacetDim,
 } from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
@@ -46,6 +48,13 @@ const SCOPE_TABS = [
   { value: "news", label: "News", icon: Newspaper },
   { value: "comments", label: "Comments", icon: MessagesSquare },
 ] as const;
+
+// Domain doesn't exist on the Comments side, so a stored preference for it
+// must not make us compute counts nothing will render.
+const AVAILABLE_DIMS: Record<Scope, ValueFacetDim[]> = {
+  news: ["domain", "author"],
+  comments: ["author"],
+};
 
 export function SearchApp() {
   const searchParams = useSearchParams();
@@ -94,10 +103,27 @@ export function SearchApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Expanding a facet section is a display change, not a filter change, so it
+  // goes through this setter and never touches `state` — which also means it
+  // can't reset pagination the way update() does.
+  const [facetPrefs, toggleFacet] = useOpenFacets();
+
+  // A section with active selections is force-expanded — its values have to
+  // stay visible. Derived here rather than in useOpenFacets so it never gets
+  // persisted as an explicit preference. Iterating AVAILABLE_DIMS (rather than
+  // the preference set) also keeps the order stable, which matters because
+  // this lands in the TanStack query key.
+  const openFacets = useMemo(() => {
+    const open = new Set(facetPrefs);
+    if (state.domains.length) open.add("domain");
+    if (state.authors.length) open.add("author");
+    return AVAILABLE_DIMS[state.scope].filter((d) => open.has(d));
+  }, [facetPrefs, state.domains, state.authors, state.scope]);
+
   const debouncedQ = useDebounced(state.q);
   const queryState = useMemo(
-    () => ({ ...state, q: debouncedQ }),
-    [state, debouncedQ],
+    () => ({ ...state, q: debouncedQ, openFacets }),
+    [state, debouncedQ, openFacets],
   );
   const search = useHNSearch(queryState);
 
@@ -143,6 +169,8 @@ export function SearchApp() {
     <FacetRail
       state={state}
       facets={search.data?.facets}
+      openFacets={openFacets}
+      onToggleFacet={toggleFacet}
       onChange={update}
       onReset={resetFilters}
       showReset={hasActiveFilters(state)}
