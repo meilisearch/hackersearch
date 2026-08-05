@@ -445,6 +445,7 @@ export function SearchApp() {
               }}
               onPrefetchPage={prefetchPage}
               onState={update}
+              onOpenThread={openThread}
             />
           )}
         </section>

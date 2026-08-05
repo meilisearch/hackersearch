@@ -4,8 +4,12 @@ import type { UseQueryResult } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import { MEILI_HOST, type HNSearchResult } from "@/lib/meili";
-import { hasActiveFilters, type SearchState } from "@/lib/search-state";
+import { MEILI_HOST, type HNHit, type HNSearchResult } from "@/lib/meili";
+import {
+  hasActiveFilters,
+  type SearchState,
+  type ThreadState,
+} from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 import { HitCard } from "./hit-card";
@@ -16,6 +20,7 @@ interface ResultsProps {
   onPage: (page: number) => void;
   onPrefetchPage: (page: number) => void;
   onState: (patch: Partial<SearchState>) => void;
+  onOpenThread: (thread: ThreadState, seed?: HNHit) => void;
 }
 
 export function Results({
@@ -24,6 +29,7 @@ export function Results({
   onPage,
   onPrefetchPage,
   onState,
+  onOpenThread,
 }: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
 
@@ -106,6 +112,7 @@ export function Results({
             domains={state.domains}
             authors={state.authors}
             onState={onState}
+            onOpenThread={onOpenThread}
           />
         ))}
       </div>
