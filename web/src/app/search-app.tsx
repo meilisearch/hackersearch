@@ -21,22 +21,26 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
-import { EMBEDDER, searchHN } from "@/lib/meili";
+import { EMBEDDER, searchHN, type HNHit } from "@/lib/meili";
 import { useDebounced, useHNSearch } from "@/hooks/use-hn-search";
 import { useOpenFacets } from "@/hooks/use-open-facets";
 import {
   hasActiveFilters,
   paramsToState,
   stateToParams,
+  threadFromParams,
+  threadToParams,
   type Scope,
   type SearchState,
   type SortKey,
+  type ThreadState,
   type ValueFacetDim,
 } from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 import { FacetRail } from "./facet-rail";
 import { Results } from "./results";
+import { ThreadView } from "./thread-view";
 
 const SORT_TABS: { value: SortKey; label: string }[] = [
   { value: "relevance", label: "Relevance" },
@@ -61,11 +65,23 @@ export function SearchApp() {
   const [state, setState] = useState<SearchState>(() =>
     paramsToState(new URLSearchParams(searchParams.toString())),
   );
+  const [thread, setThread] = useState<ThreadState | null>(() =>
+    threadFromParams(new URLSearchParams(searchParams.toString())),
+  );
+  // The already-loaded hit behind an open thread, so its header paints without
+  // a fetch. Absent on deep links and after a back/forward navigation.
+  const [threadSeed, setThreadSeed] = useState<HNHit | undefined>(undefined);
+  // Opening or closing a thread is a navigation and pushes; every other state
+  // change keeps rewriting the current entry, as the app has always done.
+  const historyMode = useRef<"replace" | "push">("replace");
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Every filter change resets pagination; explicit page changes override.
+  // Touching any search control also leaves an open thread — no dead controls.
   const update = useCallback((patch: Partial<SearchState>) => {
     setState((prev) => ({ ...prev, page: 1, ...patch }));
+    setThread(null);
+    setThreadSeed(undefined);
   }, []);
 
   // Tags and domains only exist on the News side; points-sort is meaningless
@@ -83,14 +99,33 @@ export function SearchApp() {
             ? "relevance"
             : prev.sort,
       }));
+      setThread(null);
+      setThreadSeed(undefined);
     },
     [],
   );
 
   useEffect(() => {
-    const qs = stateToParams(state).toString();
-    window.history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
-  }, [state]);
+    const params = threadToParams(thread, stateToParams(state));
+    const qs = params.toString();
+    const url = qs ? `?${qs}` : window.location.pathname;
+    if (historyMode.current === "push") window.history.pushState(null, "", url);
+    else window.history.replaceState(null, "", url);
+    historyMode.current = "replace";
+  }, [state, thread]);
+
+  // The app wrote history with replaceState only, so back did nothing. Now that
+  // threads push entries, both kinds of state have to be rehydrated from the URL.
+  useEffect(() => {
+    const onPopState = () => {
+      const params = new URLSearchParams(window.location.search);
+      setState(paramsToState(params));
+      setThread(threadFromParams(params));
+      setThreadSeed(undefined);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -158,6 +193,27 @@ export function SearchApp() {
       dateRange: "all",
       minPoints: 0,
     });
+
+  const openThread = useCallback((next: ThreadState, seed?: HNHit) => {
+    historyMode.current = "push";
+    setThread(next);
+    setThreadSeed(seed);
+    window.scrollTo({ top: 0 });
+  }, []);
+
+  const closeThread = useCallback(() => {
+    historyMode.current = "push";
+    setThread(null);
+    setThreadSeed(undefined);
+  }, []);
+
+  // A deep link can point at a comment; ThreadView resolves it upward and the
+  // URL is corrected in place rather than pushing a second history entry.
+  const replaceThread = useCallback((next: ThreadState) => {
+    setThread(next);
+    setThreadSeed(undefined);
+  }, []);
+
   const activeFilterCount =
     state.tags.length +
     state.domains.length +
@@ -371,16 +427,26 @@ export function SearchApp() {
         </aside>
 
         <section className="min-w-0 flex-1">
-          <Results
-            search={search}
-            state={state}
-            onPage={(page) => {
-              update({ page });
-              window.scrollTo({ top: 0 });
-            }}
-            onPrefetchPage={prefetchPage}
-            onState={update}
-          />
+          {thread ? (
+            <ThreadView
+              rootId={thread.rootId}
+              focusId={thread.focusId}
+              seed={threadSeed}
+              onClose={closeThread}
+              onResolveRoot={replaceThread}
+            />
+          ) : (
+            <Results
+              search={search}
+              state={state}
+              onPage={(page) => {
+                update({ page });
+                window.scrollTo({ top: 0 });
+              }}
+              onPrefetchPage={prefetchPage}
+              onState={update}
+            />
+          )}
         </section>
       </main>
 
