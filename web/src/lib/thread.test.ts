@@ -7,8 +7,11 @@ import {
   countDescendants,
   fetchThread,
   FRONTIER_CHUNK,
+  MAX_ANCESTOR_HOPS,
   MAX_COMMENTS,
   MAX_DEPTH,
+  resolveThreadRoot,
+  type DocumentFetch,
   type LevelSearch,
 } from "@/lib/thread";
 
@@ -243,5 +246,89 @@ describe("fetchThread", () => {
     const result = await fetchThread(1, { search, now: () => ticks[i++] });
 
     expect(result.elapsedMs).toBe(42);
+  });
+});
+
+function story(id: number): HNHit {
+  return {
+    id,
+    type: "story",
+    tags: ["story"],
+    title: `story ${id}`,
+    author: `u${id}`,
+    points: 10,
+    num_comments: 3,
+    created_at: id,
+  };
+}
+
+/** A DocumentFetch over a fixed set of documents; anything else 404s. */
+function stubDocs(docs: HNHit[]): DocumentFetch {
+  const byId = new Map(docs.map((d) => [d.id, d]));
+  return async (id) => byId.get(id) ?? null;
+}
+
+describe("resolveThreadRoot", () => {
+  it("returns the story a nested comment belongs to", async () => {
+    const fetchDocument = stubDocs([story(1), comment(2, 1), comment(3, 2)]);
+
+    const result = await resolveThreadRoot(3, { fetchDocument });
+
+    expect(result?.root.id).toBe(1);
+    expect(result?.partial).toBe(false);
+  });
+
+  it("returns a story handed to it directly", async () => {
+    const fetchDocument = stubDocs([story(1)]);
+
+    const result = await resolveThreadRoot(1, { fetchDocument });
+
+    expect(result?.root.id).toBe(1);
+    expect(result?.partial).toBe(false);
+  });
+
+  it("treats a job or poll as a valid thread root", async () => {
+    const job: HNHit = { ...story(1), type: "job", tags: ["job"] };
+    const fetchDocument = stubDocs([job, comment(2, 1)]);
+
+    const result = await resolveThreadRoot(2, { fetchDocument });
+
+    expect(result?.root.id).toBe(1);
+    expect(result?.partial).toBe(false);
+  });
+
+  it("stops at the highest reachable ancestor when the chain breaks", async () => {
+    // 2's parent (99) was deleted and never indexed.
+    const fetchDocument = stubDocs([comment(2, 99), comment(3, 2)]);
+
+    const result = await resolveThreadRoot(3, { fetchDocument });
+
+    expect(result?.root.id).toBe(2);
+    expect(result?.partial).toBe(true);
+  });
+
+  it("returns null when the starting item is not in the index", async () => {
+    const fetchDocument = stubDocs([]);
+
+    expect(await resolveThreadRoot(7, { fetchDocument })).toBeNull();
+  });
+
+  it("gives up after MAX_ANCESTOR_HOPS on a very deep chain", async () => {
+    // A chain far longer than the hop cap, with no story at the top.
+    const fetchDocument: DocumentFetch = async (id) => comment(id, id + 1);
+
+    const result = await resolveThreadRoot(1, { fetchDocument });
+
+    expect(result?.partial).toBe(true);
+    expect(result?.root.id).toBe(1 + MAX_ANCESTOR_HOPS);
+  });
+
+  it("terminates on a cyclic ancestor chain", async () => {
+    // 2 -> 3 -> 2 -> ... with no story anywhere.
+    const fetchDocument = stubDocs([comment(2, 3), comment(3, 2)]);
+
+    const result = await resolveThreadRoot(2, { fetchDocument });
+
+    expect(result?.partial).toBe(true);
   });
 });

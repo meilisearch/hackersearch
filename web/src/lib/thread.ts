@@ -177,3 +177,57 @@ export async function fetchThread(
 
   return { comments, depth, truncated, elapsedMs: Math.round(now() - startedAt), error };
 }
+
+/** Ancestor lookups before the upward walk gives up. */
+export const MAX_ANCESTOR_HOPS = 25;
+
+export type DocumentFetch = (id: number) => Promise<HNHit | null>;
+
+/**
+ * Read one document by id. meilisearch 0.59's `getDocument` takes no
+ * `extraRequestInit`, so this cannot be given an AbortSignal — callers rely on
+ * TanStack discarding results for keys it no longer observes.
+ */
+export const meiliDocumentFetch: DocumentFetch = async (id) => {
+  try {
+    return await meili.index(INDEX_UID).getDocument<HNHit>(id);
+  } catch {
+    // Deleted, dead, or simply never indexed — all the same to the caller.
+    return null;
+  }
+};
+
+export interface ThreadRoot {
+  /** The item the thread should be rendered from. */
+  root: HNHit;
+  /** True when the walk stopped on a broken chain rather than a real root. */
+  partial: boolean;
+}
+
+/**
+ * Walk `parent` upward until a non-comment item is found — a story, job or
+ * poll can all host a thread. Returns the highest reachable ancestor when the
+ * chain breaks on a deleted item, so a partial thread can still be shown.
+ */
+export async function resolveThreadRoot(
+  startId: number,
+  options: { fetchDocument?: DocumentFetch } = {},
+): Promise<ThreadRoot | null> {
+  const { fetchDocument = meiliDocumentFetch } = options;
+
+  let current = await fetchDocument(startId);
+  if (!current) return null;
+
+  const seen = new Set<number>([startId]);
+  for (let hop = 0; hop < MAX_ANCESTOR_HOPS; hop += 1) {
+    if (current.type !== "comment") return { root: current, partial: false };
+    if (current.parent == null || seen.has(current.parent)) {
+      return { root: current, partial: true };
+    }
+    seen.add(current.parent);
+    const parent = await fetchDocument(current.parent);
+    if (!parent) return { root: current, partial: true };
+    current = parent;
+  }
+  return { root: current, partial: true };
+}
