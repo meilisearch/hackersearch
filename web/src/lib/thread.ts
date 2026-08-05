@@ -1,3 +1,5 @@
+import { MeilisearchApiError } from "meilisearch";
+
 import { INDEX_UID, meili, type HNHit } from "./meili";
 
 /** Hard stops for the downward walk. */
@@ -183,6 +185,11 @@ export const MAX_ANCESTOR_HOPS = 25;
 
 export type DocumentFetch = (id: number) => Promise<HNHit | null>;
 
+/** True only for a genuine 404 from Meilisearch — not a network or server failure. */
+export function isDocumentNotFound(error: unknown): boolean {
+  return error instanceof MeilisearchApiError && error.cause?.code === "document_not_found";
+}
+
 /**
  * Read one document by id. meilisearch 0.59's `getDocument` takes no
  * `extraRequestInit`, so this cannot be given an AbortSignal — callers rely on
@@ -191,9 +198,12 @@ export type DocumentFetch = (id: number) => Promise<HNHit | null>;
 export const meiliDocumentFetch: DocumentFetch = async (id) => {
   try {
     return await meili.index(INDEX_UID).getDocument<HNHit>(id);
-  } catch {
-    // Deleted, dead, or simply never indexed — all the same to the caller.
-    return null;
+  } catch (error) {
+    // Only a genuinely absent document means "no such item" — deleted, dead,
+    // or never indexed. Anything else (network, 5xx, auth) must propagate, or
+    // an outage would be reported to the user as a broken ancestor chain.
+    if (isDocumentNotFound(error)) return null;
+    throw error;
   }
 };
 

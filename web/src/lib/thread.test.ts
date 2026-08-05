@@ -1,3 +1,4 @@
+import { MeilisearchApiError } from "meilisearch";
 import { describe, expect, it } from "vitest";
 
 import type { HNHit } from "@/lib/meili";
@@ -7,6 +8,7 @@ import {
   countDescendants,
   fetchThread,
   FRONTIER_CHUNK,
+  isDocumentNotFound,
   MAX_ANCESTOR_HOPS,
   MAX_COMMENTS,
   MAX_DEPTH,
@@ -268,6 +270,34 @@ function stubDocs(docs: HNHit[]): DocumentFetch {
   return async (id) => byId.get(id) ?? null;
 }
 
+describe("isDocumentNotFound", () => {
+  it("is true for a MeilisearchApiError whose cause code is document_not_found", () => {
+    const error = new MeilisearchApiError(new Response(null, { status: 404 }), {
+      message: "Document `7` not found.",
+      code: "document_not_found",
+      type: "invalid_request",
+      link: "https://docs.meilisearch.com/errors#document_not_found",
+    });
+
+    expect(isDocumentNotFound(error)).toBe(true);
+  });
+
+  it("is false for a MeilisearchApiError with a different cause code", () => {
+    const error = new MeilisearchApiError(new Response(null, { status: 500 }), {
+      message: "An internal error has occurred.",
+      code: "internal",
+      type: "internal",
+      link: "https://docs.meilisearch.com/errors#internal",
+    });
+
+    expect(isDocumentNotFound(error)).toBe(false);
+  });
+
+  it("is false for a plain error, such as a network failure", () => {
+    expect(isDocumentNotFound(new Error("network down"))).toBe(false);
+  });
+});
+
 describe("resolveThreadRoot", () => {
   it("returns the story a nested comment belongs to", async () => {
     const fetchDocument = stubDocs([story(1), comment(2, 1), comment(3, 2)]);
@@ -338,5 +368,18 @@ describe("resolveThreadRoot", () => {
     // The `seen` guard has to stop the walk on the first revisit. Without it
     // the hop cap would still yield partial:true, but only after 26 lookups.
     expect(lookups).toBe(2);
+  });
+
+  it("propagates when fetchDocument rejects, instead of reporting a partial thread", async () => {
+    // A network/5xx/auth failure must surface as a rejection — swallowing it
+    // here would render as a false "original post missing" banner during an
+    // outage instead of a fetch error.
+    const fetchDocument: DocumentFetch = async () => {
+      throw new Error("meilisearch unreachable");
+    };
+
+    await expect(resolveThreadRoot(1, { fetchDocument })).rejects.toThrow(
+      "meilisearch unreachable",
+    );
   });
 });
