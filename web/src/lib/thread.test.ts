@@ -33,8 +33,8 @@ describe("buildTree", () => {
   it("orders siblings by created_at, then by id as a tiebreak", () => {
     const tree = buildTree(1, [
       comment(4, 1, 300),
-      comment(2, 1, 100),
       comment(3, 1, 100),
+      comment(2, 1, 100),
     ]);
 
     expect(tree.map((n) => n.id)).toEqual([2, 3, 4]);
