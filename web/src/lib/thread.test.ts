@@ -325,10 +325,18 @@ describe("resolveThreadRoot", () => {
 
   it("terminates on a cyclic ancestor chain", async () => {
     // 2 -> 3 -> 2 -> ... with no story anywhere.
-    const fetchDocument = stubDocs([comment(2, 3), comment(3, 2)]);
+    const byId = new Map([comment(2, 3), comment(3, 2)].map((d) => [d.id, d]));
+    let lookups = 0;
+    const fetchDocument: DocumentFetch = async (id) => {
+      lookups += 1;
+      return byId.get(id) ?? null;
+    };
 
     const result = await resolveThreadRoot(2, { fetchDocument });
 
     expect(result?.partial).toBe(true);
+    // The `seen` guard has to stop the walk on the first revisit. Without it
+    // the hop cap would still yield partial:true, but only after 26 lookups.
+    expect(lookups).toBe(2);
   });
 });
