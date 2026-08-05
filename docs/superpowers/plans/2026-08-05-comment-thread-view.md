@@ -1191,6 +1191,11 @@ export function ThreadView({
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   useEffect(() => setCollapsed(new Set()), [rootId]);
 
+  // A failed upward resolve is NOT a broken ancestor chain, and must not be
+  // reported as one — see the banner condition below.
+  const [resolveFailed, setResolveFailed] = useState(false);
+  useEffect(() => setResolveFailed(false), [rootId]);
+
   const rootDoc = useQuery({
     queryKey: ["hn-item", rootId],
     queryFn: () => meiliDocumentFetch(rootId),
@@ -1203,10 +1208,17 @@ export function ThreadView({
   useEffect(() => {
     if (rootDoc.data?.type !== "comment") return;
     let cancelled = false;
-    resolveThreadRoot(rootId).then((resolved) => {
-      if (cancelled || !resolved || resolved.root.id === rootId) return;
-      onResolveRoot({ rootId: resolved.root.id, focusId: rootId });
-    });
+    resolveThreadRoot(rootId)
+      .then((resolved) => {
+        if (cancelled || !resolved || resolved.root.id === rootId) return;
+        onResolveRoot({ rootId: resolved.root.id, focusId: rootId });
+      })
+      .catch(() => {
+        // meiliDocumentFetch only swallows document_not_found; anything here
+        // is a real fetch failure, so say so rather than claiming the post
+        // isn't indexed.
+        if (!cancelled) setResolveFailed(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -1238,7 +1250,30 @@ export function ThreadView({
 
   const root = rootDoc.data;
 
-  if (rootDoc.isFetched && !root) {
+  // isSuccess, not isFetched: a thrown query also counts as fetched, and
+  // "not in the index" would then be a lie about a Meilisearch failure.
+  if (rootDoc.isError) {
+    return (
+      <Notice title="Couldn't load this thread">
+        <p>Meilisearch didn't answer for item #{rootId}.</p>
+        <div className="mt-3 flex gap-4">
+          <button onClick={onClose} className="hover:text-primary">
+            ← back to results
+          </button>
+          <a
+            href={hnItemUrl(rootId)}
+            target="_blank"
+            rel="noreferrer"
+            className="hover:text-primary"
+          >
+            view on HN ↗
+          </a>
+        </div>
+      </Notice>
+    );
+  }
+
+  if (rootDoc.isSuccess && !root) {
     return (
       <Notice title="That item isn't in the index">
         <p>
@@ -1282,7 +1317,7 @@ export function ThreadView({
 
       {root ? <RootHeader root={root} /> : <RootSkeleton />}
 
-      {root?.type === "comment" && (
+      {root?.type === "comment" && !resolveFailed && (
         <p className="mt-2 border border-accent-foreground/25 bg-accent px-2 py-1 font-mono text-[11px] text-accent-foreground">
           This thread's original post isn't in the index — showing the
           discussion from the highest comment we could reach.
@@ -1314,7 +1349,7 @@ export function ThreadView({
         )}
       </div>
 
-      {(isError || result?.error) && (
+      {(isError || result?.error || resolveFailed) && (
         <p className="mt-3 flex items-center gap-2 border p-3 font-mono text-xs text-muted-foreground">
           <TriangleAlert className="size-3.5 shrink-0" />
           Couldn't load deeper replies.
