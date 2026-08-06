@@ -1,0 +1,33 @@
+---
+title: Introduction
+description: All of Hacker News, indexed in Meilisearch, behind a faceted search UI.
+---
+
+HackerSearch is a full replacement for HN Search. It ingests the complete
+Hacker News corpus — every story, every comment, back to item #1 — into a
+single Meilisearch index and serves it through a unified web UI with facets.
+
+## Components
+
+| Component | Stack | Role |
+|---|---|---|
+| `indexer/` | Rust (tokio + reqwest) | Backfills the corpus from the HN Firebase API and follows live updates |
+| `web/` | Next.js App Router, Tailwind v4, shadcn/ui, TanStack Query | Instant search UI with disjunctive facets |
+| Meilisearch | `getmeili/meilisearch` | The search engine, index uid `hn` |
+
+## Quick start
+
+```sh
+docker compose watch
+```
+
+Open [http://localhost:3000](http://localhost:3000). The indexer configures the
+index, backfills the most recent 100k items in about two minutes, then keeps
+the index fresh every 30 seconds. Set `BACKFILL_RECENT=` (empty) to index the
+full ~45M-item corpus instead (~17 hours, resumable).
+
+## Facets
+
+Results can be filtered by **type** (story, comment, Ask HN, Show HN,
+Launch HN, job, poll), **time range**, **minimum points**, **domain**, and
+**author** — with live counts on every facet value.

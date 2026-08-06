@@ -1,0 +1,18 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "HackerSearch",
+  "colors": {
+    "primary": "#ff5c00",
+    "light": "#ff7a33",
+    "dark": "#cc4a00"
+  },
+  "navigation": [
+    {
+      "group": "Guide",
+      "pages": ["introduction", "indexing", "searching"]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/meilisearch"
+  }
+}
