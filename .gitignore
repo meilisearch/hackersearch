@@ -7,3 +7,4 @@ indexer-state.json
 *.log
 .DS_Store
 .superpowers/
+docs/
