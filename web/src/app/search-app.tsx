@@ -242,7 +242,9 @@ export function SearchApp() {
         <div className="mx-auto w-full max-w-6xl px-4 pt-5 pb-0 sm:px-6">
           <div className="flex items-baseline justify-between gap-4">
             <div className="flex items-baseline gap-2.5">
-              <span className="grid size-7 translate-y-1 place-items-center bg-primary font-mono text-lg font-semibold text-primary-foreground">
+              {/* self-center against the title's line box (both 28px) instead
+                  of a baseline + translate nudge, which sat visibly high. */}
+              <span className="grid size-7 self-center place-items-center bg-primary font-mono text-lg font-semibold text-primary-foreground">
                 H
               </span>
               <h1 className="text-xl font-semibold tracking-tight">
