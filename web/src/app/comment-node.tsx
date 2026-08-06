@@ -10,18 +10,25 @@ import { cn } from "@/lib/utils";
 
 interface CommentNodeProps {
   node: ThreadNode;
-  collapsed: Set<number>;
+  /** Ids whose collapse state has been flipped from its depth default —
+   *  membership inverts, it doesn't mean "collapsed". */
+  toggled: Set<number>;
   focusId?: number;
   onToggle: (id: number) => void;
 }
 
 export const CommentNode = memo(function CommentNodeInner({
   node,
-  collapsed,
+  toggled,
   focusId,
   onToggle,
 }: CommentNodeProps) {
-  const isCollapsed = collapsed.has(node.id);
+  // Top-level comments start expanded; deeper replies start as collapsed
+  // stubs so a big thread reads as a scannable list of top comments. The
+  // default is derived from depth (not stored) because levels stream in —
+  // a node arriving late must still get the right initial state.
+  const defaultCollapsed = node.depth > 0;
+  const isCollapsed = toggled.has(node.id) ? !defaultCollapsed : defaultCollapsed;
   const isFocus = node.id === focusId;
   const hidden = isCollapsed ? countDescendants(node) : 0;
   const timeAgo = node.created_at
@@ -90,7 +97,7 @@ export const CommentNode = memo(function CommentNodeInner({
             <CommentNode
               key={child.id}
               node={child}
-              collapsed={collapsed}
+              toggled={toggled}
               focusId={focusId}
               onToggle={onToggle}
             />

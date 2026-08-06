@@ -8,7 +8,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { hnItemUrl, hnUserUrl, type HNHit } from "@/lib/meili";
 import type { ThreadState } from "@/lib/search-state";
-import { buildTree, meiliDocumentFetch, resolveThreadRoot } from "@/lib/thread";
+import {
+  buildTree,
+  MAX_DEPTH,
+  meiliDocumentFetch,
+  resolveThreadRoot,
+} from "@/lib/thread";
 import { useThread } from "@/hooks/use-thread";
 
 import { CommentNode } from "./comment-node";
@@ -31,7 +36,9 @@ export function ThreadView({
   onClose,
   onResolveRoot,
 }: ThreadViewProps) {
-  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  // Ids whose collapse state was flipped from its depth default (top level
+  // expanded, replies collapsed) — by a click, or by the focus reveal below.
+  const [toggled, setToggled] = useState<Set<number>>(new Set());
 
   // A failed upward resolve is NOT a broken ancestor chain, and must not be
   // reported as one — see the banner condition below.
@@ -49,7 +56,7 @@ export function ThreadView({
   const [trackedRootId, setTrackedRootId] = useState(rootId);
   if (trackedRootId !== rootId) {
     setTrackedRootId(rootId);
-    setCollapsed(new Set());
+    setToggled(new Set());
     setResolveFailed(false);
     setChainBroken(false);
   }
@@ -91,8 +98,30 @@ export function ThreadView({
   const { comments, result, isError, isWalking, refetch } = useThread(rootId);
   const tree = useMemo(() => buildTree(rootId, comments), [rootId, comments]);
 
+  // A focused comment usually sits below the fold of the collapsed-by-default
+  // tree, so it wouldn't render — expand the path down to it, once per focus.
+  // Only non-top-level nodes go in: for depth 0 (parent === rootId) membership
+  // in `toggled` means COLLAPSED, the opposite of what a reveal wants. Runs
+  // during render (the "adjust state when props change" pattern, like the
+  // trackedRootId reset above) and re-checks each level until the walk has
+  // actually delivered the focused comment.
+  const [revealedFor, setRevealedFor] = useState<string | null>(null);
+  const revealKey = `${rootId}:${focusId}`;
+  if (focusId && revealedFor !== revealKey) {
+    const parentOf = new Map(comments.map((c) => [c.id, c.parent]));
+    if (parentOf.has(focusId)) {
+      setRevealedFor(revealKey);
+      const path: number[] = [];
+      let cur: number | undefined = focusId;
+      for (let hop = 0; hop < MAX_DEPTH && cur !== undefined && cur !== rootId; hop++) {
+        if (parentOf.get(cur) !== rootId) path.push(cur);
+        cur = parentOf.get(cur);
+      }
+      if (path.length) setToggled((prev) => new Set([...prev, ...path]));
+    }
+  }
+
   // Scroll to the comment that was searched for, once it has actually loaded.
-  // Re-runs as levels arrive because a deep comment appears late in the walk.
   const focused = useRef(false);
   useEffect(() => {
     focused.current = false;
@@ -102,13 +131,17 @@ export function ThreadView({
     const el = document.getElementById(`c-${focusId}`);
     if (!el) return;
     focused.current = true;
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
-    // comments.length is a deliberate dependency: a deep comment appears late
-    // in the walk, so this effect keeps retrying until the anchor exists.
-  }, [focusId, comments.length]);
+    // Instant, not smooth: a smooth scroll gets silently dropped in some
+    // embedded webviews, and levels still streaming in below would fight
+    // the animation anyway. Landing on the comment is what matters.
+    el.scrollIntoView({ block: "center" });
+    // comments.length and toggled are deliberate dependencies: a deep comment
+    // appears late in the walk AND only renders after the reveal above expands
+    // its ancestors, so this effect retries on both until the anchor exists.
+  }, [focusId, comments.length, toggled]);
 
   const toggle = (id: number) =>
-    setCollapsed((prev) => {
+    setToggled((prev) => {
       const next = new Set(prev);
       if (!next.delete(id)) next.add(id);
       return next;
@@ -201,7 +234,7 @@ export function ThreadView({
           <CommentNode
             key={node.id}
             node={node}
-            collapsed={collapsed}
+            toggled={toggled}
             focusId={focusId}
             onToggle={toggle}
           />
