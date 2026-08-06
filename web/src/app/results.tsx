@@ -4,11 +4,16 @@ import type { UseQueryResult } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import { MEILI_HOST, type HNSearchResult } from "@/lib/meili";
-import { hasActiveFilters, type SearchState } from "@/lib/search-state";
+import { MEILI_HOST, type HNHit, type HNSearchResult } from "@/lib/meili";
+import {
+  hasActiveFilters,
+  type SearchState,
+  type ThreadState,
+} from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 import { HitCard } from "./hit-card";
+import { Notice } from "./notice";
 
 interface ResultsProps {
   search: UseQueryResult<HNSearchResult, Error>;
@@ -16,6 +21,7 @@ interface ResultsProps {
   onPage: (page: number) => void;
   onPrefetchPage: (page: number) => void;
   onState: (patch: Partial<SearchState>) => void;
+  onOpenThread: (thread: ThreadState, seed?: HNHit) => void;
 }
 
 export function Results({
@@ -24,6 +30,7 @@ export function Results({
   onPage,
   onPrefetchPage,
   onState,
+  onOpenThread,
 }: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
 
@@ -106,6 +113,7 @@ export function Results({
             domains={state.domains}
             authors={state.authors}
             onState={onState}
+            onOpenThread={onOpenThread}
           />
         ))}
       </div>
@@ -116,26 +124,6 @@ export function Results({
         onPage={onPage}
         onPrefetchPage={onPrefetchPage}
       />
-    </div>
-  );
-}
-
-function Notice({
-  title,
-  icon,
-  children,
-}: {
-  title: string;
-  icon?: React.ReactNode;
-  children?: React.ReactNode;
-}) {
-  return (
-    <div className="mt-6 border bg-card p-6 font-mono text-sm text-muted-foreground">
-      <h2 className="mb-2 flex items-center gap-2 font-semibold text-foreground">
-        {icon}
-        {title}
-      </h2>
-      {children}
     </div>
   );
 }

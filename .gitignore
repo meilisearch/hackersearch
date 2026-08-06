@@ -6,3 +6,5 @@ node_modules/
 indexer-state.json
 *.log
 .DS_Store
+.superpowers/
+docs/superpowers/

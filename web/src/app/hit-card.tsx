@@ -5,7 +5,7 @@ import { ArrowUpRight, MessageSquare, TriangleAlert } from "lucide-react";
 import { memo } from "react";
 
 import { hnItemUrl, type HNHit } from "@/lib/meili";
-import type { SearchState } from "@/lib/search-state";
+import type { SearchState, ThreadState } from "@/lib/search-state";
 import { cn } from "@/lib/utils";
 
 import { Highlighted } from "./highlighted";
@@ -29,6 +29,7 @@ interface HitCardProps {
   // memo below actually skips re-rendering the list on every keystroke.
   domains: string[];
   authors: string[];
+  onOpenThread: (thread: ThreadState, seed?: HNHit) => void;
 }
 
 export const HitCard = memo(function HitCard({
@@ -36,6 +37,7 @@ export const HitCard = memo(function HitCard({
   onState,
   domains,
   authors,
+  onOpenThread,
 }: HitCardProps) {
   const isComment = hit.type === "comment";
   const timeAgo = hit.created_at
@@ -134,14 +136,27 @@ export const HitCard = memo(function HitCard({
           </button>
         </span>
         <span className="hidden sm:inline">{timeAgo}</span>
+        <button
+          onClick={() =>
+            isComment
+              ? // A comment's own id is a valid starting point: ThreadView
+                // resolves it upward and corrects the URL to the real root.
+                onOpenThread({ rootId: hit.id, focusId: hit.id })
+              : onOpenThread({ rootId: hit.id }, hit)
+          }
+          className="inline-flex items-center gap-1 hover:text-primary hover:underline"
+        >
+          <MessageSquare className="size-3" />
+          {isComment ? "thread" : `${hit.num_comments} comments`}
+        </button>
         <a
           href={hnItemUrl(hit.id)}
           target="_blank"
           rel="noreferrer"
-          className="inline-flex items-center gap-1 hover:text-primary"
+          className="hover:text-primary"
+          title="View on Hacker News"
         >
-          <MessageSquare className="size-3" />
-          {isComment ? "thread" : `${hit.num_comments} comments`}
+          HN ↗
         </a>
       </div>
     </article>

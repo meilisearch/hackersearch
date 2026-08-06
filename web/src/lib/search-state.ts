@@ -106,3 +106,35 @@ export function paramsToState(p: URLSearchParams): SearchState {
     page: Math.max(1, Number(p.get("page")) || 1),
   };
 }
+
+/**
+ * Which thread is open, if any. Deliberately NOT part of SearchState: that
+ * object is the TanStack query key for searches, and folding the thread into
+ * it would refetch every result each time a thread opens or closes.
+ */
+export interface ThreadState {
+  rootId: number;
+  focusId?: number;
+}
+
+const positiveId = (raw: string | null): number | null => {
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : null;
+};
+
+export function threadToParams(
+  thread: ThreadState | null,
+  params: URLSearchParams,
+): URLSearchParams {
+  if (!thread) return params;
+  params.set("item", String(thread.rootId));
+  if (thread.focusId != null) params.set("c", String(thread.focusId));
+  return params;
+}
+
+export function threadFromParams(params: URLSearchParams): ThreadState | null {
+  const rootId = positiveId(params.get("item"));
+  if (rootId === null) return null;
+  const focusId = positiveId(params.get("c"));
+  return focusId === null ? { rootId } : { rootId, focusId };
+}
