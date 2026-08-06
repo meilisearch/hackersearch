@@ -70,5 +70,8 @@ export function useThread(rootId: number | null) {
     // `result?.error` for walk failures, not `isError`.
     isError: query.isError,
     isWalking: query.isFetching,
+    // Re-runs the whole walk (queryFn clears the accumulator first) — the
+    // retry affordance for a walk that failed partway down.
+    refetch: query.refetch,
   };
 }

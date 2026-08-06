@@ -13,6 +13,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import { HitCard } from "./hit-card";
+import { Notice } from "./notice";
 
 interface ResultsProps {
   search: UseQueryResult<HNSearchResult, Error>;
@@ -123,26 +124,6 @@ export function Results({
         onPage={onPage}
         onPrefetchPage={onPrefetchPage}
       />
-    </div>
-  );
-}
-
-function Notice({
-  title,
-  icon,
-  children,
-}: {
-  title: string;
-  icon?: React.ReactNode;
-  children?: React.ReactNode;
-}) {
-  return (
-    <div className="mt-6 border bg-card p-6 font-mono text-sm text-muted-foreground">
-      <h2 className="mb-2 flex items-center gap-2 font-semibold text-foreground">
-        {icon}
-        {title}
-      </h2>
-      {children}
     </div>
   );
 }

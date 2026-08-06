@@ -8,7 +8,7 @@ export const MAX_COMMENTS = 2000;
 /** Ids per `parent IN [...]` filter, to keep filter strings bounded. */
 export const FRONTIER_CHUNK = 500;
 /** Meilisearch page size for one level chunk. */
-export const LEVEL_PAGE_SIZE = 1000;
+const LEVEL_PAGE_SIZE = 1000;
 
 export interface ThreadNode extends HNHit {
   children: ThreadNode[];
@@ -78,7 +78,7 @@ export type LevelSearch = (
 ) => Promise<{ hits: HNHit[]; totalPages: number }>;
 
 /** The real Meilisearch query behind one level chunk. */
-export const meiliLevelSearch: LevelSearch = async (parentIds, page, signal) => {
+const meiliLevelSearch: LevelSearch = async (parentIds, page, signal) => {
   const res = await meili.index(INDEX_UID).search(
     "",
     {

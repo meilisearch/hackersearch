@@ -12,6 +12,7 @@ import { buildTree, meiliDocumentFetch, resolveThreadRoot } from "@/lib/thread";
 import { useThread } from "@/hooks/use-thread";
 
 import { CommentNode } from "./comment-node";
+import { Notice } from "./notice";
 
 interface ThreadViewProps {
   rootId: number;
@@ -35,16 +36,22 @@ export function ThreadView({
   // A failed upward resolve is NOT a broken ancestor chain, and must not be
   // reported as one — see the banner condition below.
   const [resolveFailed, setResolveFailed] = useState(false);
+  // Set only once the upward resolve has SETTLED at a comment. While the
+  // resolve is still climbing (every comment-card click passes through here),
+  // the root being a comment proves nothing — showing the broken-chain banner
+  // during that window would flash a false claim on every click.
+  const [chainBroken, setChainBroken] = useState(false);
 
-  // Reset collapsed state and resolve-failure state when the thread changes,
-  // during render rather than in an effect — same "adjust state when props
-  // change" pattern as useThread's `trackedRoot` — so a stale thread's
-  // collapsed set or failure banner is never briefly shown under a new root.
+  // Reset collapsed state and resolve state when the thread changes, during
+  // render rather than in an effect — same "adjust state when props change"
+  // pattern as useThread's `trackedRoot` — so a stale thread's collapsed set
+  // or banners are never briefly shown under a new root.
   const [trackedRootId, setTrackedRootId] = useState(rootId);
   if (trackedRootId !== rootId) {
     setTrackedRootId(rootId);
     setCollapsed(new Set());
     setResolveFailed(false);
+    setChainBroken(false);
   }
 
   const rootDoc = useQuery({
@@ -61,7 +68,13 @@ export function ThreadView({
     let cancelled = false;
     resolveThreadRoot(rootId)
       .then((resolved) => {
-        if (cancelled || !resolved || resolved.root.id === rootId) return;
+        if (cancelled) return;
+        if (!resolved || resolved.root.id === rootId) {
+          // The walk ended here: this comment IS the highest reachable
+          // ancestor, so the chain above it is genuinely broken.
+          setChainBroken(true);
+          return;
+        }
         onResolveRoot({ rootId: resolved.root.id, focusId: rootId });
       })
       .catch(() => {
@@ -75,7 +88,7 @@ export function ThreadView({
     };
   }, [rootDoc.data?.type, rootId, onResolveRoot]);
 
-  const { comments, result, isError, isWalking } = useThread(rootId);
+  const { comments, result, isError, isWalking, refetch } = useThread(rootId);
   const tree = useMemo(() => buildTree(rootId, comments), [rootId, comments]);
 
   // Scroll to the comment that was searched for, once it has actually loaded.
@@ -170,7 +183,7 @@ export function ThreadView({
 
       {root ? <RootHeader root={root} /> : <RootSkeleton />}
 
-      {root?.type === "comment" && !resolveFailed && (
+      {root?.type === "comment" && chainBroken && (
         <p className="mt-2 border border-accent-foreground/25 bg-accent px-2 py-1 font-mono text-[11px] text-accent-foreground">
           This thread&apos;s original post isn&apos;t in the index — showing
           the discussion from the highest comment we could reach.
@@ -206,6 +219,15 @@ export function ThreadView({
         <p className="mt-3 flex items-center gap-2 border p-3 font-mono text-xs text-muted-foreground">
           <TriangleAlert className="size-3.5 shrink-0" />
           Couldn&apos;t load deeper replies.
+          {/* A resolve failure isn't fixed by re-walking, so no retry there. */}
+          {(isError || result?.error) && (
+            <button
+              onClick={() => refetch()}
+              className="text-primary hover:underline"
+            >
+              retry
+            </button>
+          )}
           <a
             href={hnItemUrl(rootId)}
             target="_blank"
@@ -294,15 +316,6 @@ function RootSkeleton() {
     <div className="flex flex-col gap-2 border-b-2 py-3">
       <Skeleton className="h-4 w-4/5" />
       <Skeleton className="h-3 w-2/5" />
-    </div>
-  );
-}
-
-function Notice({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="mt-6 border bg-card p-6 font-mono text-sm text-muted-foreground">
-      <h2 className="mb-2 font-semibold text-foreground">{title}</h2>
-      {children}
     </div>
   );
 }
