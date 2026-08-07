@@ -416,11 +416,15 @@ async fn enrich_loop(
             .collect()
             .await;
 
-        extracted += updates
+        let with_content = updates
             .iter()
             .filter(|u| u.get("content").is_some())
             .count() as u64;
+        extracted += with_content;
         attempted += batch_len;
+
+        counter!("hn_indexer_enrich_attempted_total").increment(batch_len);
+        counter!("hn_indexer_enrich_extracted_total").increment(with_content);
 
         // The next fetch_enrichable relies on the `enriched` flag being
         // visible, so wait for the update task to finish.
