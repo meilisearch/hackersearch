@@ -21,6 +21,8 @@ services:
     build:
       context: ./indexer
       dockerfile: Dockerfile.dev
+    ports:
+      - "9464:9464"
     depends_on:
       meilisearch:
         condition: service_healthy
@@ -30,6 +32,9 @@ services:
       # Depth of the initial backfill. Unset it (empty) to index the FULL corpus.
       BACKFILL_RECENT: ${BACKFILL_RECENT:-100000}
       INDEXER_STATE_FILE: /data/indexer-state.json
+      # Prometheus metrics. 0.0.0.0 because 127.0.0.1 inside the container
+      # would make the published port unreachable from the host.
+      INDEXER_METRICS_ADDR: 0.0.0.0:9464
     volumes:
       - indexer_state:/data
       - cargo-registry:/usr/local/cargo/registry
