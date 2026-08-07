@@ -1,6 +1,7 @@
 mod enrich;
 mod hn;
 mod meili;
+mod obs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +61,15 @@ struct Cli {
         global = true
     )]
     state_file: PathBuf,
+
+    /// Address for the Prometheus /metrics listener; empty string disables it
+    #[arg(
+        long,
+        env = "INDEXER_METRICS_ADDR",
+        default_value = "127.0.0.1:9464",
+        global = true
+    )]
+    metrics_addr: String,
 
     #[command(subcommand)]
     command: Command,
@@ -434,6 +444,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    obs::init(&cli.metrics_addr);
 
     let state = if cli.state_file.exists() {
         let raw = tokio::fs::read(&cli.state_file)
