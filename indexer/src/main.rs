@@ -199,6 +199,8 @@ impl Ctx {
 async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
     let total = from.saturating_sub(to) + 1;
     info!("backfill: items {to}..={from} ({total} ids)");
+    gauge!("hn_indexer_backfill_active").set(1.0);
+    gauge!("hn_indexer_backfill_floor").set(to as f64);
     let started = Instant::now();
     let mut processed: u64 = 0;
     let mut cursor = from;
@@ -209,6 +211,9 @@ async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
         let chunk_len = ids.len() as u64;
         let docs = ctx.index_ids(ids).await?;
         processed += chunk_len;
+        gauge!("hn_indexer_backfill_cursor").set(low as f64);
+        counter!("hn_indexer_backfill_ids_processed_total").increment(chunk_len);
+        counter!("hn_indexer_backfill_docs_indexed_total").increment(docs as u64);
 
         {
             let mut state = ctx.state.lock().await;
@@ -229,6 +234,7 @@ async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
                 "backfill complete: {processed} ids in {:?}",
                 started.elapsed()
             );
+            gauge!("hn_indexer_backfill_active").set(0.0);
             return Ok(());
         }
         cursor = low - 1;
@@ -587,11 +593,15 @@ async fn main() -> Result<()> {
                         Ok(Some((from, to))) => match backfill(&backfill_ctx, from, to).await {
                             Ok(()) => break,
                             Err(e) => {
+                                gauge!("hn_indexer_backfill_active").set(0.0);
                                 warn!("backfill failed, resuming from checkpoint in 60s: {e:#}")
                             }
                         },
                         Ok(None) => break,
-                        Err(e) => warn!("backfill setup failed, retrying in 60s: {e:#}"),
+                        Err(e) => {
+                            gauge!("hn_indexer_backfill_active").set(0.0);
+                            warn!("backfill setup failed, retrying in 60s: {e:#}")
+                        }
                     }
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
