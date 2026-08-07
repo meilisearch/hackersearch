@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -167,8 +168,19 @@ impl Ctx {
                 let client = self.hn.clone();
                 async move {
                     match hn::fetch_item(&client, id).await {
-                        Ok(item) => item.and_then(hn::to_doc),
+                        Ok(Some(item)) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "ok")
+                                .increment(1);
+                            hn::to_doc(item)
+                        }
+                        Ok(None) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "null")
+                                .increment(1);
+                            None
+                        }
                         Err(e) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "error")
+                                .increment(1);
                             warn!("skipping item {id}: {e:#}");
                             None
                         }
