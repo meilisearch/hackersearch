@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
-use metrics::counter;
+use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -266,11 +266,31 @@ async fn sync(ctx: &Ctx, interval: u64) -> Result<()> {
                 state.sync_last_max = last_max;
             }
             ctx.save_state().await?;
+            gauge!("hn_indexer_hn_maxitem").set(max as f64);
+            gauge!("hn_indexer_sync_last_max").set(max as f64);
+            counter!("hn_indexer_sync_new_ids_total").increment(new_count as u64);
+            counter!("hn_indexer_sync_docs_indexed_total").increment(docs as u64);
+            gauge!("hn_indexer_sync_last_success_timestamp_seconds").set(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            );
             info!("sync: {new_count} new ids, {docs} docs indexed (maxitem {max})");
             anyhow::Ok(())
         };
-        if let Err(e) = tick.await {
-            warn!("sync tick failed, will retry: {e:#}");
+        let tick_started = Instant::now();
+        let result = tick.await;
+        histogram!("hn_indexer_sync_tick_duration_seconds")
+            .record(tick_started.elapsed().as_secs_f64());
+        match result {
+            Ok(()) => {
+                counter!("hn_indexer_sync_ticks_total", "result" => "ok").increment(1);
+            }
+            Err(e) => {
+                counter!("hn_indexer_sync_ticks_total", "result" => "error").increment(1);
+                warn!("sync tick failed, will retry: {e:#}");
+            }
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
     }
