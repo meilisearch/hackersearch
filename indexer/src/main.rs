@@ -89,8 +89,10 @@ enum Command {
         /// Stop after attempting this many documents (useful for testing)
         #[arg(long)]
         limit: Option<u64>,
-        /// Page extractor: auto (cloudflare when CLOUDFLARE_ACCOUNT_ID +
-        /// CLOUDFLARE_API_TOKEN are set, else local), local, or cloudflare
+        /// Page extractor. Every page is fetched and extracted locally first
+        /// (free); `auto` adds a Cloudflare browser-render fallback for pages
+        /// that yield no text when CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN
+        /// are set, `cloudflare` requires them, `local` never uses them
         #[arg(long, env = "ENRICH_EXTRACTOR", default_value = "auto")]
         extractor: String,
         /// Only enrich stories posted on or after this date (YYYY-MM-DD)
@@ -393,8 +395,9 @@ impl BatchStats {
             format!(" ({})", list.join(", "))
         };
         format!(
-            ", cloudflare {} ok / {} empty / {} throttled-out / {} http-err{codes} / \
-             {} timeout / {} transport, {} retries on 429, avg {avg:.1}s per render{local}",
+            "{local}, cloudflare fallback {} ok / {} empty / {} throttled-out / \
+             {} http-err{codes} / {} timeout / {} transport, {} retries on 429, \
+             avg {avg:.1}s per render",
             self.cf_content,
             self.cf_empty,
             self.cf_throttled,
@@ -423,45 +426,42 @@ async fn enrich_loop(
     watch: Option<Duration>,
     cf_concurrency: usize,
 ) -> Result<()> {
+    // Plain fetches must fail fast — a slow server shouldn't hold a slot the
+    // next page could use — while a browser render legitimately takes tens
+    // of seconds. Hence two clients with different timeouts.
     let pages = reqwest::Client::builder()
-        .timeout(Duration::from_secs(if cloudflare.is_some() {
-            60
-        } else {
-            15
-        }))
+        .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent("HackerSearchBot/0.1 (article-content enrichment)")
         .build()?;
-    // Browser rendering is a scarcer resource than plain GETs, and its limit
-    // is set by the Cloudflare plan, so it is configurable rather than fixed.
-    let fetch_concurrency = if cloudflare.is_some() {
-        cf_concurrency.max(1)
-    } else {
-        ctx.concurrency.min(32)
-    };
+    let renders = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    // Every page gets the free local fetch first; a plain GET handles the
+    // large majority of HN links. Only pages it can't extract (JS shells, bot
+    // walls) go to Cloudflare, which bills per render. Its plan-bound
+    // concurrency is enforced with a semaphore, so it caps the renders
+    // without throttling the local fetches down to the same number.
+    let fetch_concurrency = ctx.concurrency.min(32);
+    let cf_concurrency = cf_concurrency.max(1);
+    let cf_permits = Arc::new(tokio::sync::Semaphore::new(cf_concurrency));
     // Nothing is written back until a whole batch finishes, so the batch is
-    // the unit of both progress logging and loss on restart. A rendered page
-    // costs seconds, so with Cloudflare a 500-story batch meant minutes of
-    // silence and minutes of thrown-away work on any restart; ten rounds of
-    // the concurrency keeps both to about a minute. Plain GETs are fast
-    // enough that the larger batch costs nothing.
-    let max_batch: u64 = if cloudflare.is_some() {
-        (fetch_concurrency * 10) as u64
-    } else {
-        500
-    };
+    // the unit of both progress logging and loss on restart; this keeps both
+    // to roughly a minute.
+    let max_batch: u64 = 250;
     info!(
-        "enrich: extractor = {} (concurrency {fetch_concurrency}, batches of {max_batch})",
+        "enrich: extractor = {} (fetch concurrency {fetch_concurrency}, batches of {max_batch})",
         if cloudflare.is_some() {
-            "cloudflare browser rendering (local fallback)"
+            format!("local first, cloudflare fallback ({cf_concurrency} concurrent renders)")
         } else {
-            "local"
+            "local only".to_string()
         }
     );
 
     let started = Instant::now();
     let mut attempted: u64 = 0;
     let mut extracted: u64 = 0;
+    let mut described: u64 = 0;
 
     loop {
         let batch_size = match limit {
@@ -487,48 +487,63 @@ async fn enrich_loop(
 
         let crawl_started = Instant::now();
         let results: Vec<(serde_json::Value, BatchStats)> = stream::iter(batch)
-            .map(|(id, url)| {
+            .map(|story| {
                 let pages = pages.clone();
+                let renders = renders.clone();
                 let cloudflare = cloudflare.clone();
+                let cf_permits = cf_permits.clone();
                 async move {
                     let mut stats = BatchStats::default();
-                    // Prefer the rendered-browser markdown when available;
-                    // fall back to a plain fetch + local extraction.
-                    let mut content = match &cloudflare {
-                        Some(cf) => {
+                    let url = &story.url;
+                    // 1. Plain fetch + local extraction. Free, and it yields
+                    //    the page's own description even when the body is a
+                    //    JavaScript shell with no text to extract.
+                    let page = match enrich::fetch_page(&pages, url).await {
+                        Ok(Some(html)) => Some(enrich::extract_page(
+                            &html,
+                            max_chars,
+                            story.title.as_deref(),
+                        )),
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::debug!("enrich: fetch failed for {url}: {e:#}");
+                            None
+                        }
+                    };
+                    let (mut content, description) =
+                        page.map_or((None, None), |p| (p.content, p.description));
+                    stats.local_attempts += 1;
+                    stats.local_content += u64::from(content.is_some());
+
+                    // 2. Only what the plain fetch couldn't extract is sent to
+                    //    the billed browser.
+                    if content.is_none() {
+                        if let Some(cf) = &cloudflare {
+                            let _permit = cf_permits
+                                .acquire()
+                                .await
+                                .expect("semaphore is never closed");
                             let attempt =
-                                enrich::markdown_via_cloudflare(&pages, cf, &url, max_chars).await;
+                                enrich::markdown_via_cloudflare(&renders, cf, url, max_chars).await;
                             stats.record_cloudflare(&attempt);
-                            match attempt.outcome {
-                                enrich::CfOutcome::Content(text) => Some(text),
-                                _ => None,
+                            if let enrich::CfOutcome::Content(text) = attempt.outcome {
+                                content = Some(text);
                             }
                         }
-                        None => None,
-                    };
-                    if content.is_none() {
-                        content = match enrich::fetch_page(&pages, &url).await {
-                            Ok(Some(html)) => enrich::extract_content(&html, max_chars),
-                            Ok(None) => None,
-                            Err(e) => {
-                                tracing::debug!("enrich: fetch failed for {url}: {e:#}");
-                                None
-                            }
-                        };
-                        stats.local_attempts += 1;
-                        stats.local_content += u64::from(content.is_some());
                     }
-                    // `content` is deliberately tri-state:
+
+                    // `content` and `description` are deliberately tri-state:
                     //   absent      — never attempted
                     //   ""          — attempted, nothing extractable
-                    //   non-empty   — extracted article text
+                    //   non-empty   — extracted text
                     // Writing "" (rather than leaving the field off) is what
                     // makes a permanent extraction failure distinguishable
                     // from a story the crawler has not reached yet.
                     let update = serde_json::json!({
-                        "id": id,
+                        "id": story.id,
                         "enrich_gen": meili::ENRICH_GENERATION,
                         "content": content.unwrap_or_default(),
+                        "description": description.unwrap_or_default(),
                     });
                     (update, stats)
                 }
@@ -546,10 +561,14 @@ async fn enrich_loop(
             })
             .collect();
 
-        extracted += updates
-            .iter()
-            .filter(|u| u["content"].as_str().is_some_and(|c| !c.is_empty()))
-            .count() as u64;
+        let non_empty = |field: &str| {
+            updates
+                .iter()
+                .filter(|u| u[field].as_str().is_some_and(|v| !v.is_empty()))
+                .count() as u64
+        };
+        extracted += non_empty("content");
+        described += non_empty("description");
         attempted += batch_len;
 
         // The next fetch_enrichable relies on the `enrich_gen` stamps being
@@ -564,7 +583,8 @@ async fn enrich_loop(
 
         let rate = attempted as f64 / started.elapsed().as_secs_f64().max(0.001);
         info!(
-            "enrich: {attempted} attempted, {extracted} with content ({rate:.2} docs/s) \
+            "enrich: {attempted} attempted, {extracted} with content, {described} with \
+             description ({rate:.2} docs/s) \
              | batch: crawl {crawl_secs:.0}s, write+wait {write_secs:.0}s{}",
             stats.summary(cloudflare.is_some())
         );
@@ -581,7 +601,8 @@ async fn enrich_loop(
     }
 
     info!(
-        "enrich complete: {extracted}/{attempted} documents got article content in {:?}",
+        "enrich complete: {extracted}/{attempted} documents got article content, \
+         {described} a description, in {:?}",
         started.elapsed()
     );
     Ok(())

@@ -9,10 +9,14 @@ pub const INDEX_UID: &str = "hn";
 /// stamped with an older one (or nothing at all — which covers both
 /// never-enriched documents and those written before this field existed,
 /// when the marker was a bare `enriched: true`).
-pub const ENRICH_GENERATION: u32 = 2;
+///
+/// History: 2 = Cloudflare-first crawl; 3 = local-first crawl that also
+/// stores the page's own `description`.
+pub const ENRICH_GENERATION: u32 = 3;
 
-/// What gets embedded for each document: the title, plus the crawled article
-/// text when there is some. Comments are never embedded.
+/// What gets embedded for each document: the title, plus the page's own
+/// description and the crawled article text when there are some. Comments are
+/// never embedded.
 ///
 /// How comments are excluded is load-bearing and non-obvious, so read this
 /// before touching the template. Measured on Meilisearch v1.49:
@@ -31,10 +35,20 @@ pub const ENRICH_GENERATION: u32 = 2;
 ///   skip, which is why never-crawled stories (no `content`) still embed
 ///   their title.
 ///
-/// `content` is tri-state (absent / "" / text) and Liquid treats "" as
-/// truthy, hence the explicit `!= ""`.
+/// `content` and `description` are tri-state (absent / "" / text) and Liquid
+/// treats "" as truthy, hence the explicit `!= ""`. Both sit inside `{% if %}`
+/// branches, so a story missing either still embeds its title.
 pub const ARTICLE_FRAGMENT: &str = "{{ doc.title }}\
+{% if doc.description and doc.description != \"\" %}\n{{ doc.description }}{% endif %}\
 {% if doc.content and doc.content != \"\" %}\n{{ doc.content | truncatewords: 400 }}{% endif %}";
+
+/// A story waiting to be enriched.
+pub struct Enrichable {
+    pub id: u64,
+    pub url: String,
+    /// Used to discard page descriptions that only repeat the title.
+    pub title: Option<String>,
+}
 
 pub struct Meili {
     client: reqwest::Client,
@@ -243,7 +257,7 @@ impl Meili {
         &self,
         limit: usize,
         since: Option<i64>,
-    ) -> Result<Vec<(u64, String)>> {
+    ) -> Result<Vec<Enrichable>> {
         let mut filter = format!(
             "type = \"story\" AND url EXISTS \
              AND (enrich_gen NOT EXISTS OR enrich_gen < {ENRICH_GENERATION})"
@@ -253,7 +267,7 @@ impl Meili {
         }
         let body = json!({
             "filter": filter,
-            "fields": ["id", "url"],
+            "fields": ["id", "url", "title"],
             "limit": limit,
         });
         let resp: serde_json::Value = self
@@ -271,7 +285,13 @@ impl Meili {
         let results = resp["results"].as_array().cloned().unwrap_or_default();
         Ok(results
             .into_iter()
-            .filter_map(|doc| Some((doc["id"].as_u64()?, doc["url"].as_str()?.to_string())))
+            .filter_map(|doc| {
+                Some(Enrichable {
+                    id: doc["id"].as_u64()?,
+                    url: doc["url"].as_str()?.to_string(),
+                    title: doc["title"].as_str().map(str::to_string),
+                })
+            })
             .collect())
     }
 

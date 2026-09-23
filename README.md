@@ -82,7 +82,8 @@ documents are plain text and the UI never renders HTML from HN.
 Inspired by [hackerverse](https://github.com/wilsonzlin/hackerverse):
 `hn-indexer enrich` fetches the page each story links to, strips
 semantically non-primary HTML (`nav`, `header`, `footer`, `aside`, scripts…),
-and stores the main article text on the document as `content`. That field is
+and stores the main article text on the document as `content`, plus the
+page's own `description` (meta, Open Graph or JSON-LD). That field is
 **not full-text indexed** — it exists to feed embeddings, so semantic search
 understands what an article is *about* rather than only its title.
 
@@ -94,10 +95,10 @@ OPENAI_API_KEY=… hn-indexer embedder openai   # text-embedding-3-small
 VOYAGE_API_KEY=… hn-indexer embedder voyage   # voyage-3.5-lite
 ```
 
-`content` is **tri-state**, so a page that can never be extracted is
-distinguishable from one the crawler simply hasn't reached:
+`content` and `description` are **tri-state**, so a page that can never be
+extracted is distinguishable from one the crawler simply hasn't reached:
 
-| `content` | Meaning |
+| value | Meaning |
 |---|---|
 | absent | never attempted |
 | `""` | attempted, nothing extractable (paywall, PDF, dead link…) |
@@ -125,18 +126,40 @@ Pair it with `ENRICH_SINCE`. Crawling every story URL in the corpus is a
 ~48-hour job at Cloudflare's capped concurrency; compose defaults to
 `2025-01-01` so the window stays bounded. Widen it by setting an earlier date.
 
-Two extractors are available (`--extractor auto|local|cloudflare`):
+Extraction is **local first, Cloudflare only as a fallback**
+(`--extractor auto|local|cloudflare`):
 
-- **local** — plain HTTP fetch + readability-style extraction with the
-  `scraper` crate (strips nav/header/footer/aside/scripts, prefers
-  `<article>`/`<main>`). No dependencies, ~83% success rate.
-- **cloudflare** — [Browser Rendering's markdown endpoint](https://developers.cloudflare.com/browser-run/quick-actions/markdown-endpoint/):
-  a real headless browser renders the page (JS-heavy sites included) and
-  returns markdown, which is cleaned of link targets/images before storage.
-  Needs `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`; concurrency is
-  capped at 6 and 429s are retried with backoff. Any per-page failure falls
-  back to the local extractor. `auto` (the default) uses Cloudflare exactly
-  when the credentials are present.
+1. **Local, for every page** — plain HTTP fetch + readability-style
+   extraction with the `scraper` crate (strips nav/header/footer/aside/scripts,
+   prefers `<article>`/`<main>`). Free and fast. Measured on 240 real HN
+   stories: 82.5% got article text, 79% a description, at ~15 stories/s.
+2. **Cloudflare, only for what local couldn't extract** —
+   [Browser Rendering's markdown endpoint](https://developers.cloudflare.com/browser-run/quick-actions/markdown-endpoint/)
+   renders the page in a real headless browser (JS shells, bot walls) and
+   returns markdown, cleaned of link targets/images before storage. Needs
+   `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`; renders are capped by
+   `ENRICH_CF_CONCURRENCY` (default 6) independently of the local fetches,
+   and 429s are retried with backoff. `auto` (the default) enables the
+   fallback exactly when the credentials are present.
+
+The order matters for cost: Cloudflare bills per render, and sending every
+page to it first meant paying for the ~80% a free GET already handles.
+Much of the remainder is login walls and paywalls (Twitter, FT, NYT) that a
+browser can't get past either.
+
+`description` is collected from the same free fetch — so it exists even for
+JavaScript shells with no extractable body. On a sample of HN links about
+60% carried a page-specific, sentence-length one; they read as teasers
+rather than summaries, so it complements `content` rather than replacing it.
+Descriptions shorter than 20 characters or that merely repeat the title are
+dropped.
+
+Each batch logs where its time went and how every page was obtained:
+
+```
+enrich: 240 attempted, 198 with content, 189 with description (15.40 docs/s)
+  | batch: crawl 15s, write+wait 1s, local 198/240 ok, cloudflare fallback …
+```
 
 **Only stories are embedded — comments never are.** Each story embeds its
 title, plus the crawled article text when there is some. `hn-indexer embedder`
