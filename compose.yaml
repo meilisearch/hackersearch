@@ -2,7 +2,9 @@ name: hackersearch
 
 services:
   meilisearch:
-    image: getmeili/meilisearch:v1.15
+    # Matches production. The embedder needs indexing fragments (the
+    # `multimodal` experimental feature), which v1.15 does not have.
+    image: getmeili/meilisearch:v1.49.0
     ports:
       # 7701 on the host: 7700 is commonly taken by other local Meilisearch instances.
       - "7701:7700"

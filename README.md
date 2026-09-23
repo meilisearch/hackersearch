@@ -54,7 +54,7 @@ hn-indexer run [--recent N] [--enrich] # settings + backfill + sync (+ enrich), 
 hn-indexer enrich                      # crawl story URLs, store extracted article text
 hn-indexer enrich --since 2025-01-01   # …only stories posted on or after a date
 hn-indexer enrich --watch              # …and keep going, picking up new stories
-hn-indexer settings --embedder huggingface|openai   # enable semantic search
+hn-indexer embedder openai|voyage     # enable semantic search (stories only, never comments)
 ```
 
 | Env var | Default | Purpose |
@@ -90,8 +90,8 @@ understands what an article is *about* rather than only its title.
 hn-indexer enrich                        # crawl + extract (resumable, ~23 docs/s)
 hn-indexer enrich --since 2025-01-01     # scope to recent stories
 hn-indexer enrich --watch                # stay up, enriching newly indexed stories
-hn-indexer settings --embedder huggingface   # local ONNX model, no API key
-OPENAI_API_KEY=… hn-indexer settings --embedder openai  # text-embedding-3-small
+OPENAI_API_KEY=… hn-indexer embedder openai   # text-embedding-3-small
+VOYAGE_API_KEY=… hn-indexer embedder voyage   # voyage-3.5-lite
 ```
 
 `content` is **tri-state**, so a page that can never be extracted is
@@ -138,11 +138,44 @@ Two extractors are available (`--extractor auto|local|cloudflare`):
   back to the local extractor. `auto` (the default) uses Cloudflare exactly
   when the credentials are present.
 
-The embedder's document template prefers `title + content`, falling back to
-the item's own text (comments). Once embeddings exist, the UI shows a
-**✦ semantic** toggle (set `NEXT_PUBLIC_MEILISEARCH_EMBEDDER=default`) that
-blends keyword and vector results (`semanticRatio: 0.6`). Run `enrich` before
-enabling the embedder so documents aren't embedded twice.
+**Only stories are embedded — comments never are.** Each story embeds its
+title, plus the crawled article text when there is some. `hn-indexer embedder`
+touches only the `embedders` setting (it never pushes the rest of the index
+settings), so it is safe on an existing production index where `settings`
+would trigger a full reindex.
+
+How comments are kept out is subtle, and was measured on Meilisearch v1.49
+rather than assumed:
+
+- A plain `documentTemplate` cannot do it. A template that renders to an empty
+  string still gets embedded — as `""` — so every comment would share one
+  identical vector.
+- The embedder therefore uses a `rest` source with an **indexing fragment**
+  (the `multimodal` experimental feature, which the command enables). A
+  fragment is skipped for a document only when it *outputs* a field the
+  document lacks, and comments have no `title`. See `ARTICLE_FRAGMENT` in
+  `indexer/src/meili.rs` — and note that adding a `doc.type` check there would
+  *break* the exclusion, not tighten it. A unit test guards this.
+- Fragments are `rest`-only, so the local HuggingFace embedder is not offered:
+  it could only embed everything, comments included.
+
+The command makes one embedding call itself before configuring anything. That
+measures the vector size (fragments require an explicit `dimensions`) and
+fails fast on a bad key or model instead of leaving a broken embedder behind.
+It returns the settings task uid without waiting — that task also embeds every
+existing story, which on the full corpus runs for hours.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` / `VOYAGE_API_KEY` | — | Provider key (required) |
+| `OPENAI_EMBED_MODEL` / `VOYAGE_EMBED_MODEL` | `text-embedding-3-small` / `voyage-3.5-lite` | Model |
+| `EMBEDDER_URL` | provider endpoint | Any OpenAI-compatible embeddings endpoint |
+| `EMBEDDER_DIMENSIONS` | probed | Skip the probe call |
+
+Once embeddings exist, the UI shows a **✦ semantic** toggle (set
+`NEXT_PUBLIC_MEILISEARCH_EMBEDDER=default`) that blends keyword and vector
+results (`semanticRatio: 0.6`). Run `enrich` before enabling the embedder so
+stories aren't embedded twice.
 
 ## The index
 

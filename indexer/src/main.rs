@@ -69,9 +69,16 @@ struct Cli {
 enum Command {
     /// Create the index and apply search settings
     Settings {
-        /// Also configure an embedder for semantic search: huggingface | openai
+        /// Also configure an embedder for semantic search: openai | voyage
         #[arg(long)]
         embedder: Option<String>,
+    },
+    /// Configure ONLY the embedder (openai | voyage), leaving every other
+    /// index setting untouched. Use this on an existing production index,
+    /// where `settings` would push the whole definition and reindex.
+    Embedder {
+        /// openai | voyage
+        kind: String,
     },
     /// Fetch the pages stories link to and store extracted article text on
     /// the documents (embedding fodder — not full-text indexed)
@@ -553,12 +560,20 @@ async fn main() -> Result<()> {
         Command::Settings { embedder } => {
             ctx.meili.apply_settings().await?;
             if let Some(kind) = embedder {
-                ctx.meili.apply_embedder(&kind).await?;
+                let _ = ctx.meili.apply_embedder(&kind).await?;
                 info!(
                     "embedder '{kind}' configured — Meilisearch is now (re)embedding all documents"
                 );
             }
             info!("index '{}' configured", meili::INDEX_UID);
+        }
+        Command::Embedder { kind } => {
+            let task = ctx.meili.apply_embedder(&kind).await?;
+            info!(
+                "embedder '{kind}' submitted as task {} — Meilisearch is now embedding \
+                 stories (never comments); follow it with GET /tasks/<uid>",
+                task.map_or("?".to_string(), |t| t.to_string())
+            );
         }
         Command::Enrich {
             max_chars,
