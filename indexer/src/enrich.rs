@@ -17,11 +17,17 @@ pub struct Cloudflare {
 }
 
 impl Cloudflare {
-    /// Built from CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN when both set.
+    /// Built from CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN when both are
+    /// set to non-empty values. Empty counts as absent: compose and shell
+    /// exports both happily define a variable as "", and blank credentials
+    /// would otherwise 401 on every page before falling back to local.
     pub fn from_env() -> Option<Self> {
+        fn non_empty(key: &str) -> Option<String> {
+            std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+        }
         Some(Self {
-            account_id: std::env::var("CLOUDFLARE_ACCOUNT_ID").ok()?,
-            token: std::env::var("CLOUDFLARE_API_TOKEN").ok()?,
+            account_id: non_empty("CLOUDFLARE_ACCOUNT_ID")?,
+            token: non_empty("CLOUDFLARE_API_TOKEN")?,
         })
     }
 }

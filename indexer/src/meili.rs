@@ -3,6 +3,14 @@ use serde_json::json;
 
 pub const INDEX_UID: &str = "hn";
 
+/// Bumped whenever the extraction pipeline changes in a way that makes
+/// already-stored `content` worth replacing. Documents carry the generation
+/// they were enriched under in `enrich_gen`; `enrich` re-processes anything
+/// stamped with an older one (or nothing at all — which covers both
+/// never-enriched documents and those written before this field existed,
+/// when the marker was a bare `enriched: true`).
+pub const ENRICH_GENERATION: u32 = 2;
+
 pub struct Meili {
     client: reqwest::Client,
     base: String,
@@ -88,6 +96,8 @@ impl Meili {
                   "features": { "facetSearch": true, "filter": { "equality": true, "comparison": false } } },
                 { "attributePatterns": ["type", "tags", "url", "enriched", "parent"],
                   "features": { "facetSearch": false, "filter": { "equality": true, "comparison": false } } },
+                { "attributePatterns": ["enrich_gen"],
+                  "features": { "facetSearch": false, "filter": { "equality": true, "comparison": true } } },
                 { "attributePatterns": ["points", "num_comments", "created_at"],
                   "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
             ],
@@ -192,10 +202,27 @@ impl Meili {
         }
     }
 
-    /// Fetch (id, url) pairs of documents that still need enrichment.
-    pub async fn fetch_enrichable(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+    /// Fetch (id, url) pairs of documents that still need enrichment:
+    /// link posts stamped with an older `enrich_gen` than the current one,
+    /// optionally limited to those created at or after `since` (unix secs).
+    ///
+    /// Documents drop out of this filter as they are stamped, so the caller
+    /// can keep pulling batches until it comes back empty — no pagination
+    /// cursor, and re-runs resume wherever the last one stopped.
+    pub async fn fetch_enrichable(
+        &self,
+        limit: usize,
+        since: Option<i64>,
+    ) -> Result<Vec<(u64, String)>> {
+        let mut filter = format!(
+            "url EXISTS AND type != \"comment\" \
+             AND (enrich_gen NOT EXISTS OR enrich_gen < {ENRICH_GENERATION})"
+        );
+        if let Some(since) = since {
+            filter.push_str(&format!(" AND created_at >= {since}"));
+        }
         let body = json!({
-            "filter": "url EXISTS AND enriched NOT EXISTS AND type != \"comment\"",
+            "filter": filter,
             "fields": ["id", "url"],
             "limit": limit,
         });
@@ -222,8 +249,13 @@ impl Meili {
     /// The document template prefers the enriched article content over the
     /// item's own text, mirroring the hackerverse approach.
     pub async fn apply_embedder(&self, kind: &str) -> Result<()> {
+        // `doc.content` is tri-state (absent = never crawled, "" = crawled
+        // but nothing extractable, non-empty = article text). Liquid counts
+        // the empty string as TRUTHY, so a bare `{% if doc.content %}` would
+        // embed an empty body for every failed extraction instead of falling
+        // through to the item's own text — hence the explicit != "" test.
         let template = "{{ doc.type }}: {% if doc.title %}{{ doc.title }}\n{% endif %}\
-            {% if doc.content %}{{ doc.content | truncatewords: 400 }}\
+            {% if doc.content and doc.content != \"\" %}{{ doc.content | truncatewords: 400 }}\
             {% elsif doc.text %}{{ doc.text | truncatewords: 200 }}{% endif %}";
         let embedder = match kind {
             "huggingface" => json!({

@@ -30,6 +30,16 @@ services:
       # Depth of the initial backfill. Unset it (empty) to index the FULL corpus.
       BACKFILL_RECENT: ${BACKFILL_RECENT:-100000}
       INDEXER_STATE_FILE: /data/indexer-state.json
+      # Passed through from the host; unset means the enrich command's
+      # `auto` extractor falls back to local HTML extraction.
+      CLOUDFLARE_ACCOUNT_ID:
+      CLOUDFLARE_API_TOKEN:
+      # Crawl article content continuously, alongside backfill and sync, so
+      # newly indexed stories get `content` without a separate command.
+      ENRICH_ON_SYNC: ${ENRICH_ON_SYNC:-true}
+      # Only crawl stories from 2025 onward. The full corpus is a multi-day
+      # job; set an earlier date (or empty) to widen the window.
+      ENRICH_SINCE: ${ENRICH_SINCE:-2025-01-01}
     volumes:
       - indexer_state:/data
       - cargo-registry:/usr/local/cargo/registry

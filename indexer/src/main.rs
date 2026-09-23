@@ -86,6 +86,19 @@ enum Command {
         /// CLOUDFLARE_API_TOKEN are set, else local), local, or cloudflare
         #[arg(long, env = "ENRICH_EXTRACTOR", default_value = "auto")]
         extractor: String,
+        /// Only enrich stories posted on or after this date (YYYY-MM-DD)
+        #[arg(long, env = "ENRICH_SINCE")]
+        since: Option<String>,
+        /// Only enrich stories posted in the last N days
+        #[arg(long, conflicts_with = "since")]
+        since_days: Option<u64>,
+        /// Keep running once the backlog drains, picking up newly indexed
+        /// stories every --interval seconds instead of exiting
+        #[arg(long, env = "ENRICH_WATCH")]
+        watch: bool,
+        /// Poll interval for --watch, in seconds
+        #[arg(long, env = "ENRICH_INTERVAL", default_value_t = 60)]
+        interval: u64,
     },
     /// Index items from --from (default: current maxitem) down to --to (default: 1)
     Backfill {
@@ -117,6 +130,18 @@ enum Command {
         /// Poll interval for live sync, in seconds
         #[arg(long, env = "SYNC_INTERVAL", default_value_t = 30)]
         interval: u64,
+        /// Also enrich story content continuously, alongside backfill and
+        /// sync, so newly indexed stories get article text without a
+        /// separate `enrich` invocation.
+        #[arg(long, env = "ENRICH_ON_SYNC")]
+        enrich: bool,
+        /// Floor for --enrich, as a date (YYYY-MM-DD). Older stories are
+        /// left alone — crawling the full corpus is a multi-day job.
+        #[arg(long, env = "ENRICH_SINCE")]
+        enrich_since: Option<String>,
+        /// Max characters of extracted content to keep, for --enrich
+        #[arg(long, env = "ENRICH_MAX_CHARS", default_value_t = 4000)]
+        enrich_max_chars: usize,
     },
 }
 
@@ -282,15 +307,21 @@ async fn resolve_backfill_range(
     Ok(Some((from, to)))
 }
 
-/// Repeatedly pull un-enriched story documents from the index, fetch the
-/// pages they link to, extract the main article text, and write it back as
-/// a partial document update ({id, content, enriched}). Failed fetches are
-/// still marked `enriched` so they aren't retried forever.
+/// Repeatedly pull story documents needing enrichment, fetch the pages they
+/// link to, extract the main article text, and write it back as a partial
+/// document update ({id, content, enrich_gen}). Failed fetches are still
+/// stamped with the generation so they aren't retried forever.
+///
+/// `since` limits the work to stories created at or after that unix second;
+/// `watch` keeps the loop alive once the backlog drains, re-polling at that
+/// interval so stories indexed later get enriched too.
 async fn enrich_loop(
     ctx: &Ctx,
     max_chars: usize,
     limit: Option<u64>,
     cloudflare: Option<enrich::Cloudflare>,
+    since: Option<i64>,
+    watch: Option<Duration>,
 ) -> Result<()> {
     let pages = reqwest::Client::builder()
         .timeout(Duration::from_secs(if cloudflare.is_some() {
@@ -328,9 +359,17 @@ async fn enrich_loop(
         if batch_size == 0 {
             break;
         }
-        let batch = ctx.meili.fetch_enrichable(batch_size).await?;
+        let batch = ctx.meili.fetch_enrichable(batch_size, since).await?;
         if batch.is_empty() {
-            break;
+            // Nothing eligible right now. In watch mode that just means the
+            // backlog is drained — wait for sync to index more and re-poll.
+            match watch {
+                Some(interval) => {
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+                None => break,
+            }
         }
         let batch_len = batch.len() as u64;
 
@@ -357,11 +396,18 @@ async fn enrich_loop(
                             }
                         };
                     }
-                    let mut update = serde_json::json!({ "id": id, "enriched": true });
-                    if let Some(content) = content {
-                        update["content"] = content.into();
-                    }
-                    update
+                    // `content` is deliberately tri-state:
+                    //   absent      — never attempted
+                    //   ""          — attempted, nothing extractable
+                    //   non-empty   — extracted article text
+                    // Writing "" (rather than leaving the field off) is what
+                    // makes a permanent extraction failure distinguishable
+                    // from a story the crawler has not reached yet.
+                    serde_json::json!({
+                        "id": id,
+                        "enrich_gen": meili::ENRICH_GENERATION,
+                        "content": content.unwrap_or_default(),
+                    })
                 }
             })
             .buffer_unordered(fetch_concurrency)
@@ -370,7 +416,7 @@ async fn enrich_loop(
 
         extracted += updates
             .iter()
-            .filter(|u| u.get("content").is_some())
+            .filter(|u| u["content"].as_str().is_some_and(|c| !c.is_empty()))
             .count() as u64;
         attempted += batch_len;
 
@@ -389,6 +435,48 @@ async fn enrich_loop(
         started.elapsed()
     );
     Ok(())
+}
+
+/// Resolve the `--since` / `--since-days` pair into a unix-seconds floor.
+fn resolve_since(since: Option<&str>, since_days: Option<u64>) -> Result<Option<i64>> {
+    if let Some(date) = since {
+        return Ok(Some(parse_date(date)?));
+    }
+    if let Some(days) = since_days {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        return Ok(Some(now - (days as i64) * 86_400));
+    }
+    Ok(None)
+}
+
+/// Parse `YYYY-MM-DD` into the unix second of its UTC midnight.
+fn parse_date(raw: &str) -> Result<i64> {
+    let parts: Vec<&str> = raw.split('-').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("expected a date as YYYY-MM-DD, got '{raw}'");
+    }
+    let year: i64 = parts[0].parse().context("parsing year")?;
+    let month: i64 = parts[1].parse().context("parsing month")?;
+    let day: i64 = parts[2].parse().context("parsing day")?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        anyhow::bail!("'{raw}' is not a valid date");
+    }
+    Ok(days_from_civil(year, month, day) * 86_400)
+}
+
+/// Days from 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`) — exact, and cheaper than a date-library dependency
+/// for the one date this binary needs to parse.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Binary-search the lowest item id created at or after `cutoff`. HN ids are
@@ -476,6 +564,10 @@ async fn main() -> Result<()> {
             max_chars,
             limit,
             extractor,
+            since,
+            since_days,
+            watch,
+            interval,
         } => {
             let cloudflare = match extractor.as_str() {
                 "local" => None,
@@ -487,8 +579,20 @@ async fn main() -> Result<()> {
                 "auto" => enrich::Cloudflare::from_env(),
                 other => anyhow::bail!("unknown extractor '{other}' (auto|local|cloudflare)"),
             };
+            let since = resolve_since(since.as_deref(), since_days)?;
+            if let Some(floor) = since {
+                info!("enrich: limited to stories created at or after {floor} (unix)");
+            }
             ctx.meili.ensure_index().await?;
-            enrich_loop(&ctx, max_chars, limit, cloudflare).await?;
+            enrich_loop(
+                &ctx,
+                max_chars,
+                limit,
+                cloudflare,
+                since,
+                watch.then(|| Duration::from_secs(interval)),
+            )
+            .await?;
         }
         Command::Backfill {
             from,
@@ -529,7 +633,13 @@ async fn main() -> Result<()> {
             ctx.meili.ensure_index().await?;
             sync(&ctx, interval).await?;
         }
-        Command::Run { recent, interval } => {
+        Command::Run {
+            recent,
+            interval,
+            enrich: enrich_enabled,
+            enrich_since,
+            enrich_max_chars,
+        } => {
             ctx.meili.ensure_index().await?;
             let max = hn::max_item(&ctx.hn).await?;
             let to = recent.map(|n| max.saturating_sub(n).max(1)).unwrap_or(1);
@@ -554,12 +664,101 @@ async fn main() -> Result<()> {
                 }
             });
 
+            // Enrichment, when enabled, runs forever in watch mode: it
+            // drains whatever is eligible, then re-polls so stories the sync
+            // loop indexes later get article text without a second command.
+            let enrich_task = if enrich_enabled {
+                let since = resolve_since(enrich_since.as_deref(), None)?;
+                let cloudflare = enrich::Cloudflare::from_env();
+                info!(
+                    "enrich-on-sync enabled (extractor = {}, floor = {})",
+                    if cloudflare.is_some() {
+                        "cloudflare"
+                    } else {
+                        "local"
+                    },
+                    since.map_or("none".to_string(), |s| s.to_string())
+                );
+                let enrich_ctx = ctx.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = enrich_loop(
+                            &enrich_ctx,
+                            enrich_max_chars,
+                            None,
+                            cloudflare.clone(),
+                            since,
+                            Some(Duration::from_secs(60)),
+                        )
+                        .await
+                        {
+                            warn!("enrich failed, retrying in 60s: {e:#}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                }))
+            } else {
+                None
+            };
+
             // Sync runs forever; backfill finishes in the background.
             let sync_result = sync(&ctx, interval).await;
             backfill_task.abort();
+            if let Some(task) = enrich_task {
+                task.abort();
+            }
             sync_result?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dates_to_utc_midnight() {
+        assert_eq!(parse_date("1970-01-01").unwrap(), 0);
+        // The cutoff this project actually cares about.
+        assert_eq!(parse_date("2025-01-01").unwrap(), 1_735_689_600);
+        // Leap day: 59 whole days after 2024-01-01.
+        assert_eq!(
+            parse_date("2024-02-29").unwrap(),
+            parse_date("2024-01-01").unwrap() + 59 * 86_400
+        );
+        // Monotonic across a century boundary (2100 is not a leap year).
+        assert!(parse_date("2100-03-01").unwrap() > parse_date("2100-02-28").unwrap());
+    }
+
+    #[test]
+    fn rejects_malformed_dates() {
+        for bad in [
+            "2025",
+            "2025-01",
+            "2025-13-01",
+            "2025-01-32",
+            "not-a-date",
+            "",
+        ] {
+            assert!(parse_date(bad).is_err(), "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn since_prefers_explicit_date_and_defaults_to_none() {
+        assert_eq!(resolve_since(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_since(Some("2025-01-01"), None).unwrap(),
+            Some(1_735_689_600)
+        );
+        // --since-days is relative, so just assert it lands in the past.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let floor = resolve_since(None, Some(30)).unwrap().unwrap();
+        assert!(floor < now && floor > now - 31 * 86_400);
+    }
 }

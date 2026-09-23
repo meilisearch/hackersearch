@@ -50,8 +50,10 @@ hn-indexer settings                    # create index + apply search settings
 hn-indexer backfill [--recent N]       # index maxitem → 1 (or just last N ids)
 hn-indexer backfill --since-days 30    # index everything posted in the last N days
 hn-indexer sync [--interval 30]        # follow new + updated items forever
-hn-indexer run [--recent N]            # settings + backfill + sync, in one process
+hn-indexer run [--recent N] [--enrich] # settings + backfill + sync (+ enrich), one process
 hn-indexer enrich                      # crawl story URLs, store extracted article text
+hn-indexer enrich --since 2025-01-01   # …only stories posted on or after a date
+hn-indexer enrich --watch              # …and keep going, picking up new stories
 hn-indexer settings --embedder huggingface|openai   # enable semantic search
 ```
 
@@ -64,6 +66,13 @@ hn-indexer settings --embedder huggingface|openai   # enable semantic search
 | `INDEXER_STATE_FILE` | `indexer-state.json` | Resume checkpoint |
 | `BACKFILL_RECENT` | — | Limit `run` backfill depth (unset = full corpus) |
 | `SYNC_INTERVAL` | `30` | Live-sync poll seconds |
+| `ENRICH_ON_SYNC` | — | Enrich continuously inside `run` (compose sets `true`) |
+| `ENRICH_SINCE` | — | Only enrich stories from this date on (compose: `2025-01-01`) |
+| `ENRICH_MAX_CHARS` | `4000` | Characters of article text kept per document |
+| `ENRICH_EXTRACTOR` | `auto` | `auto` \| `local` \| `cloudflare` |
+| `ENRICH_INTERVAL` | `60` | `--watch` poll seconds |
+| `CLOUDFLARE_ACCOUNT_ID` | — | Browser Rendering account (enables `auto`) |
+| `CLOUDFLARE_API_TOKEN` | — | Browser Rendering token (enables `auto`) |
 
 Deleted and dead items are skipped. Comment HTML is stripped at index time, so
 documents are plain text and the UI never renders HTML from HN.
@@ -79,9 +88,42 @@ understands what an article is *about* rather than only its title.
 
 ```sh
 hn-indexer enrich                        # crawl + extract (resumable, ~23 docs/s)
+hn-indexer enrich --since 2025-01-01     # scope to recent stories
+hn-indexer enrich --watch                # stay up, enriching newly indexed stories
 hn-indexer settings --embedder huggingface   # local ONNX model, no API key
 OPENAI_API_KEY=… hn-indexer settings --embedder openai  # text-embedding-3-small
 ```
+
+`content` is **tri-state**, so a page that can never be extracted is
+distinguishable from one the crawler simply hasn't reached:
+
+| `content` | Meaning |
+|---|---|
+| absent | never attempted |
+| `""` | attempted, nothing extractable (paywall, PDF, dead link…) |
+| non-empty | article text |
+
+"Never attempted" is *absent* rather than an explicit `null` on purpose:
+`add_documents` upserts with PUT, and a literal `content: null` in the sync
+payload would wipe crawled text every time HN bumps a story's score.
+
+Each processed document is stamped with `enrich_gen` (the current
+`ENRICH_GENERATION` in `meili.rs`). `enrich` selects anything stamped with an
+older generation — or nothing at all — so **bumping that constant re-crawls
+the corpus** under the new extractor without any flag or manual flag-clearing.
+Documents drop out of the selection as they're stamped, which is what makes
+the pass resumable and idempotent.
+
+### Continuous enrichment
+
+`--watch` keeps the loop alive after the backlog drains, re-polling every
+`ENRICH_INTERVAL` seconds so stories indexed later get article text too.
+`hn-indexer run --enrich` does the same thing inside the long-running service,
+next to backfill and sync — which is how compose runs it (`ENRICH_ON_SYNC`).
+
+Pair it with `ENRICH_SINCE`. Crawling every story URL in the corpus is a
+~48-hour job at Cloudflare's capped concurrency; compose defaults to
+`2025-01-01` so the window stays bounded. Widen it by setting an earlier date.
 
 Two extractors are available (`--extractor auto|local|cloudflare`):
 
@@ -107,10 +149,12 @@ enabling the embedder so documents aren't embedded twice.
 Documents (`id` primary key):
 `type`, `tags` (`story`, `comment`, `ask_hn`, `show_hn`, `launch_hn`, `job`, …),
 `title`, `text`, `url`, `domain`, `author`, `points`, `num_comments`,
-`created_at` (unix seconds), `parent`.
+`created_at` (unix seconds), `parent`, plus `content` and `enrich_gen` written
+by `enrich`.
 
 - **Searchable**: title, text, url, domain, author
-- **Facets/filters**: tags, type, author, domain, points, num_comments, created_at
+- **Facets/filters**: tags, type, author, domain, points, num_comments,
+  created_at, enrich_gen
 - **Sorts**: relevance (with a `points:desc` tiebreaker), newest, points
 
 ## The web UI
