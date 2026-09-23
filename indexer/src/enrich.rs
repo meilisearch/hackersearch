@@ -32,21 +32,55 @@ impl Cloudflare {
     }
 }
 
+/// How one Cloudflare render ended. Kept distinct so the crawler can report
+/// *why* it is slow or failing, not merely that it is.
+#[derive(Debug)]
+pub enum CfOutcome {
+    /// Rendered, and enough text survived cleaning.
+    Content(String),
+    /// Rendered (or `success: false`), but nothing usable came back.
+    Empty,
+    /// Still 429 after every retry.
+    Throttled,
+    /// Any other non-2xx status from the API.
+    Http(u16),
+    /// Our request ran past the client timeout — a render that never settled.
+    Timeout,
+    /// Connection-level failure.
+    Transport,
+}
+
+/// One Cloudflare attempt, with what it cost.
+pub struct CfAttempt {
+    pub outcome: CfOutcome,
+    /// 429 responses received; each one cost a backoff sleep.
+    pub throttled_retries: u32,
+    pub elapsed: std::time::Duration,
+}
+
 /// Render a page in Cloudflare's headless browser and get it back as
-/// markdown. Returns None on failures (caller falls back to local fetch).
+/// markdown. Never errors: every way it can end is reported in the outcome,
+/// and anything but `Content` makes the caller fall back to a local fetch.
 pub async fn markdown_via_cloudflare(
     client: &reqwest::Client,
     cf: &Cloudflare,
     url: &str,
     max_chars: usize,
-) -> Result<Option<String>> {
+) -> CfAttempt {
+    let started = std::time::Instant::now();
+    let done = |outcome: CfOutcome, throttled_retries: u32| CfAttempt {
+        outcome,
+        throttled_retries,
+        elapsed: started.elapsed(),
+    };
     let endpoint = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/browser-rendering/markdown",
         cf.account_id
     );
     let mut delay = std::time::Duration::from_secs(2);
+    let mut throttled_retries = 0;
     for _ in 0..4 {
-        let resp = client
+        let sent = client
             .post(&endpoint)
             .bearer_auth(&cf.token)
             .json(&serde_json::json!({
@@ -54,25 +88,37 @@ pub async fn markdown_via_cloudflare(
                 "gotoOptions": { "waitUntil": "networkidle2" },
             }))
             .send()
-            .await?;
+            .await;
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) if e.is_timeout() => return done(CfOutcome::Timeout, throttled_retries),
+            Err(_) => return done(CfOutcome::Transport, throttled_retries),
+        };
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            throttled_retries += 1;
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2);
             continue;
         }
         if !resp.status().is_success() {
-            return Ok(None);
+            return done(CfOutcome::Http(resp.status().as_u16()), throttled_retries);
         }
-        let body: serde_json::Value = resp.json().await?;
+        let body: serde_json::Value = match resp.json().await {
+            Ok(body) => body,
+            Err(e) if e.is_timeout() => return done(CfOutcome::Timeout, throttled_retries),
+            Err(_) => return done(CfOutcome::Transport, throttled_retries),
+        };
         if body["success"].as_bool() != Some(true) {
-            return Ok(None);
+            return done(CfOutcome::Empty, throttled_retries);
         }
-        return Ok(body["result"]
+        let outcome = body["result"]
             .as_str()
             .map(|md| truncate_chars(&clean_markdown(md), max_chars))
-            .filter(|text| text.chars().count() >= 80));
+            .filter(|text| text.chars().count() >= 80)
+            .map_or(CfOutcome::Empty, CfOutcome::Content);
+        return done(outcome, throttled_retries);
     }
-    Ok(None)
+    done(CfOutcome::Throttled, throttled_retries)
 }
 
 /// Reduce markdown to embedding-friendly prose: keep link text, drop link

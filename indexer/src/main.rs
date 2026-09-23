@@ -321,6 +321,91 @@ async fn resolve_backfill_range(
     Ok(Some((from, to)))
 }
 
+/// Per-batch tally of how pages were obtained, so each batch's log line says
+/// why it was slow or failing — throttling, timeouts, or plain slow renders —
+/// rather than only how many pages came back.
+#[derive(Default)]
+struct BatchStats {
+    cf_attempts: u64,
+    cf_content: u64,
+    cf_empty: u64,
+    cf_throttled: u64,
+    cf_http: u64,
+    /// Which non-429 statuses came back, and how often.
+    cf_http_codes: std::collections::BTreeMap<u16, u64>,
+    cf_timeout: u64,
+    cf_transport: u64,
+    throttled_retries: u64,
+    cf_secs: f64,
+    local_attempts: u64,
+    local_content: u64,
+}
+
+impl BatchStats {
+    fn record_cloudflare(&mut self, attempt: &enrich::CfAttempt) {
+        self.cf_attempts += 1;
+        self.throttled_retries += u64::from(attempt.throttled_retries);
+        self.cf_secs += attempt.elapsed.as_secs_f64();
+        match &attempt.outcome {
+            enrich::CfOutcome::Content(_) => self.cf_content += 1,
+            enrich::CfOutcome::Empty => self.cf_empty += 1,
+            enrich::CfOutcome::Throttled => self.cf_throttled += 1,
+            enrich::CfOutcome::Http(code) => {
+                self.cf_http += 1;
+                *self.cf_http_codes.entry(*code).or_default() += 1;
+            }
+            enrich::CfOutcome::Timeout => self.cf_timeout += 1,
+            enrich::CfOutcome::Transport => self.cf_transport += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &BatchStats) {
+        self.cf_attempts += other.cf_attempts;
+        self.cf_content += other.cf_content;
+        self.cf_empty += other.cf_empty;
+        self.cf_throttled += other.cf_throttled;
+        self.cf_http += other.cf_http;
+        for (code, n) in &other.cf_http_codes {
+            *self.cf_http_codes.entry(*code).or_default() += n;
+        }
+        self.cf_timeout += other.cf_timeout;
+        self.cf_transport += other.cf_transport;
+        self.throttled_retries += other.throttled_retries;
+        self.cf_secs += other.cf_secs;
+        self.local_attempts += other.local_attempts;
+        self.local_content += other.local_content;
+    }
+
+    fn summary(&self, cloudflare: bool) -> String {
+        let local = format!(", local {}/{} ok", self.local_content, self.local_attempts);
+        if !cloudflare || self.cf_attempts == 0 {
+            return local;
+        }
+        let avg = self.cf_secs / self.cf_attempts as f64;
+        let codes = if self.cf_http_codes.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = self
+                .cf_http_codes
+                .iter()
+                .map(|(code, n)| format!("{code}×{n}"))
+                .collect();
+            format!(" ({})", list.join(", "))
+        };
+        format!(
+            ", cloudflare {} ok / {} empty / {} throttled-out / {} http-err{codes} / \
+             {} timeout / {} transport, {} retries on 429, avg {avg:.1}s per render{local}",
+            self.cf_content,
+            self.cf_empty,
+            self.cf_throttled,
+            self.cf_http,
+            self.cf_timeout,
+            self.cf_transport,
+            self.throttled_retries,
+        )
+    }
+}
+
 /// Repeatedly pull story documents needing enrichment, fetch the pages they
 /// link to, extract the main article text, and write it back as a partial
 /// document update ({id, content, enrich_gen}). Failed fetches are still
@@ -400,17 +485,25 @@ async fn enrich_loop(
         }
         let batch_len = batch.len() as u64;
 
-        let updates: Vec<serde_json::Value> = stream::iter(batch)
+        let crawl_started = Instant::now();
+        let results: Vec<(serde_json::Value, BatchStats)> = stream::iter(batch)
             .map(|(id, url)| {
                 let pages = pages.clone();
                 let cloudflare = cloudflare.clone();
                 async move {
+                    let mut stats = BatchStats::default();
                     // Prefer the rendered-browser markdown when available;
                     // fall back to a plain fetch + local extraction.
                     let mut content = match &cloudflare {
-                        Some(cf) => enrich::markdown_via_cloudflare(&pages, cf, &url, max_chars)
-                            .await
-                            .unwrap_or_default(),
+                        Some(cf) => {
+                            let attempt =
+                                enrich::markdown_via_cloudflare(&pages, cf, &url, max_chars).await;
+                            stats.record_cloudflare(&attempt);
+                            match attempt.outcome {
+                                enrich::CfOutcome::Content(text) => Some(text),
+                                _ => None,
+                            }
+                        }
                         None => None,
                     };
                     if content.is_none() {
@@ -422,6 +515,8 @@ async fn enrich_loop(
                                 None
                             }
                         };
+                        stats.local_attempts += 1;
+                        stats.local_content += u64::from(content.is_some());
                     }
                     // `content` is deliberately tri-state:
                     //   absent      — never attempted
@@ -430,16 +525,26 @@ async fn enrich_loop(
                     // Writing "" (rather than leaving the field off) is what
                     // makes a permanent extraction failure distinguishable
                     // from a story the crawler has not reached yet.
-                    serde_json::json!({
+                    let update = serde_json::json!({
                         "id": id,
                         "enrich_gen": meili::ENRICH_GENERATION,
                         "content": content.unwrap_or_default(),
-                    })
+                    });
+                    (update, stats)
                 }
             })
             .buffer_unordered(fetch_concurrency)
             .collect()
             .await;
+        let crawl_secs = crawl_started.elapsed().as_secs_f64();
+        let mut stats = BatchStats::default();
+        let updates: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|(update, doc_stats)| {
+                stats.merge(&doc_stats);
+                update
+            })
+            .collect();
 
         extracted += updates
             .iter()
@@ -447,14 +552,32 @@ async fn enrich_loop(
             .count() as u64;
         attempted += batch_len;
 
-        // The next fetch_enrichable relies on the `enriched` flag being
-        // visible, so wait for the update task to finish.
+        // The next fetch_enrichable relies on the `enrich_gen` stamps being
+        // visible, so wait for the update task to finish. On a busy index this
+        // wait can dominate the batch — it sits behind every queued task —
+        // which is why it is timed separately from the crawl.
+        let write_started = Instant::now();
         if let Some(task) = ctx.meili.add_documents(&updates).await? {
             ctx.meili.wait_for_task(task).await?;
         }
+        let write_secs = write_started.elapsed().as_secs_f64();
 
         let rate = attempted as f64 / started.elapsed().as_secs_f64().max(0.001);
-        info!("enrich: {attempted} attempted, {extracted} with content ({rate:.0} docs/s)");
+        info!(
+            "enrich: {attempted} attempted, {extracted} with content ({rate:.2} docs/s) \
+             | batch: crawl {crawl_secs:.0}s, write+wait {write_secs:.0}s{}",
+            stats.summary(cloudflare.is_some())
+        );
+        if cloudflare.is_some()
+            && stats.cf_attempts > 0
+            && stats.throttled_retries * 4 > stats.cf_attempts
+        {
+            warn!(
+                "enrich: Cloudflare is throttling ({} 429s over {} renders) — \
+                 lower ENRICH_CF_CONCURRENCY",
+                stats.throttled_retries, stats.cf_attempts
+            );
+        }
     }
 
     info!(
@@ -756,6 +879,42 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt(outcome: enrich::CfOutcome, retries: u32, secs: u64) -> enrich::CfAttempt {
+        enrich::CfAttempt {
+            outcome,
+            throttled_retries: retries,
+            elapsed: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn batch_stats_attribute_every_outcome() {
+        let mut batch = BatchStats::default();
+        for a in [
+            attempt(enrich::CfOutcome::Content("x".into()), 0, 3),
+            attempt(enrich::CfOutcome::Content("y".into()), 1, 5),
+            attempt(enrich::CfOutcome::Throttled, 4, 32),
+            attempt(enrich::CfOutcome::Http(422), 0, 1),
+            attempt(enrich::CfOutcome::Http(422), 0, 1),
+            attempt(enrich::CfOutcome::Timeout, 0, 60),
+        ] {
+            let mut doc = BatchStats::default();
+            doc.record_cloudflare(&a);
+            batch.merge(&doc);
+        }
+        assert_eq!(batch.cf_attempts, 6);
+        assert_eq!(batch.cf_content, 2);
+        assert_eq!(batch.cf_throttled, 1);
+        assert_eq!(batch.throttled_retries, 5);
+        assert_eq!(batch.cf_timeout, 1);
+        let line = batch.summary(true);
+        assert!(line.contains("2 ok"), "{line}");
+        assert!(line.contains("http-err (422×2)"), "{line}");
+        assert!(line.contains("5 retries on 429"), "{line}");
+        // (3 + 5 + 32 + 1 + 1 + 60) / 6
+        assert!(line.contains("avg 17.0s"), "{line}");
+    }
 
     #[test]
     fn parses_dates_to_utc_midnight() {
