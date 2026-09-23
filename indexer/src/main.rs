@@ -106,6 +106,10 @@ enum Command {
         /// Poll interval for --watch, in seconds
         #[arg(long, env = "ENRICH_INTERVAL", default_value_t = 60)]
         interval: u64,
+        /// Concurrent Cloudflare renders. Raise it to your plan's limit; 429s
+        /// are retried with backoff, so overshooting slows down, not fails.
+        #[arg(long, env = "ENRICH_CF_CONCURRENCY", default_value_t = 6)]
+        cf_concurrency: usize,
     },
     /// Index items from --from (default: current maxitem) down to --to (default: 1)
     Backfill {
@@ -149,6 +153,9 @@ enum Command {
         /// Max characters of extracted content to keep, for --enrich
         #[arg(long, env = "ENRICH_MAX_CHARS", default_value_t = 4000)]
         enrich_max_chars: usize,
+        /// Concurrent Cloudflare renders, for --enrich
+        #[arg(long, env = "ENRICH_CF_CONCURRENCY", default_value_t = 6)]
+        enrich_cf_concurrency: usize,
     },
 }
 
@@ -329,6 +336,7 @@ async fn enrich_loop(
     cloudflare: Option<enrich::Cloudflare>,
     since: Option<i64>,
     watch: Option<Duration>,
+    cf_concurrency: usize,
 ) -> Result<()> {
     let pages = reqwest::Client::builder()
         .timeout(Duration::from_secs(if cloudflare.is_some() {
@@ -339,14 +347,26 @@ async fn enrich_loop(
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent("HackerSearchBot/0.1 (article-content enrichment)")
         .build()?;
-    // Browser rendering is a scarcer resource than plain GETs.
+    // Browser rendering is a scarcer resource than plain GETs, and its limit
+    // is set by the Cloudflare plan, so it is configurable rather than fixed.
     let fetch_concurrency = if cloudflare.is_some() {
-        ctx.concurrency.min(6)
+        cf_concurrency.max(1)
     } else {
         ctx.concurrency.min(32)
     };
+    // Nothing is written back until a whole batch finishes, so the batch is
+    // the unit of both progress logging and loss on restart. A rendered page
+    // costs seconds, so with Cloudflare a 500-story batch meant minutes of
+    // silence and minutes of thrown-away work on any restart; ten rounds of
+    // the concurrency keeps both to about a minute. Plain GETs are fast
+    // enough that the larger batch costs nothing.
+    let max_batch: u64 = if cloudflare.is_some() {
+        (fetch_concurrency * 10) as u64
+    } else {
+        500
+    };
     info!(
-        "enrich: extractor = {}",
+        "enrich: extractor = {} (concurrency {fetch_concurrency}, batches of {max_batch})",
         if cloudflare.is_some() {
             "cloudflare browser rendering (local fallback)"
         } else {
@@ -360,8 +380,8 @@ async fn enrich_loop(
 
     loop {
         let batch_size = match limit {
-            Some(cap) => (cap - attempted).min(500) as usize,
-            None => 500,
+            Some(cap) => (cap - attempted).min(max_batch) as usize,
+            None => max_batch as usize,
         };
         if batch_size == 0 {
             break;
@@ -583,6 +603,7 @@ async fn main() -> Result<()> {
             since_days,
             watch,
             interval,
+            cf_concurrency,
         } => {
             let cloudflare = match extractor.as_str() {
                 "local" => None,
@@ -606,6 +627,7 @@ async fn main() -> Result<()> {
                 cloudflare,
                 since,
                 watch.then(|| Duration::from_secs(interval)),
+                cf_concurrency,
             )
             .await?;
         }
@@ -654,6 +676,7 @@ async fn main() -> Result<()> {
             enrich: enrich_enabled,
             enrich_since,
             enrich_max_chars,
+            enrich_cf_concurrency,
         } => {
             ctx.meili.ensure_index().await?;
             let max = hn::max_item(&ctx.hn).await?;
@@ -704,6 +727,7 @@ async fn main() -> Result<()> {
                             cloudflare.clone(),
                             since,
                             Some(Duration::from_secs(60)),
+                            enrich_cf_concurrency,
                         )
                         .await
                         {
