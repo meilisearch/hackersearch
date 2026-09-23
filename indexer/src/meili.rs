@@ -203,8 +203,13 @@ impl Meili {
     }
 
     /// Fetch (id, url) pairs of documents that still need enrichment:
-    /// link posts stamped with an older `enrich_gen` than the current one,
+    /// link stories stamped with an older `enrich_gen` than the current one,
     /// optionally limited to those created at or after `since` (unix secs).
+    ///
+    /// Only `type = "story"`: comments carry no URL, and job posts do link
+    /// out — but to careers pages, which are not articles and would only add
+    /// noise to the embeddings. Show HN links are stories, so they're kept;
+    /// Ask HN posts are stories without a URL, so `url EXISTS` drops them.
     ///
     /// Documents drop out of this filter as they are stamped, so the caller
     /// can keep pulling batches until it comes back empty — no pagination
@@ -215,7 +220,7 @@ impl Meili {
         since: Option<i64>,
     ) -> Result<Vec<(u64, String)>> {
         let mut filter = format!(
-            "url EXISTS AND type != \"comment\" \
+            "type = \"story\" AND url EXISTS \
              AND (enrich_gen NOT EXISTS OR enrich_gen < {ENRICH_GENERATION})"
         );
         if let Some(since) = since {
