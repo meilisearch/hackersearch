@@ -69,15 +69,15 @@ struct Cli {
 enum Command {
     /// Create the index and apply search settings
     Settings {
-        /// Also configure an embedder for semantic search: openai | voyage
+        /// Also configure an embedder for semantic search: granite | openai | voyage
         #[arg(long)]
         embedder: Option<String>,
     },
-    /// Configure ONLY the embedder (openai | voyage), leaving every other
+    /// Configure ONLY the embedder (granite | openai | voyage), leaving every other
     /// index setting untouched. Use this on an existing production index,
     /// where `settings` would push the whole definition and reindex.
     Embedder {
-        /// openai | voyage
+        /// granite | openai | voyage
         kind: String,
     },
     /// Fetch the pages stories link to and store extracted article text on

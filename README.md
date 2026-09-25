@@ -54,7 +54,7 @@ hn-indexer run [--recent N] [--enrich] # settings + backfill + sync (+ enrich), 
 hn-indexer enrich                      # crawl story URLs, store extracted article text
 hn-indexer enrich --since 2025-01-01   # …only stories posted on or after a date
 hn-indexer enrich --watch              # …and keep going, picking up new stories
-hn-indexer embedder openai|voyage     # enable semantic search (stories only, never comments)
+hn-indexer embedder granite|openai|voyage  # enable semantic search (stories only, never comments)
 ```
 
 | Env var | Default | Purpose |
@@ -91,6 +91,7 @@ understands what an article is *about* rather than only its title.
 hn-indexer enrich                        # crawl + extract (resumable, ~23 docs/s)
 hn-indexer enrich --since 2025-01-01     # scope to recent stories
 hn-indexer enrich --watch                # stay up, enriching newly indexed stories
+LUMEN_API_KEY=… hn-indexer embedder granite   # granite multilingual: GPU for documents, local for queries
 OPENAI_API_KEY=… hn-indexer embedder openai   # text-embedding-3-small
 VOYAGE_API_KEY=… hn-indexer embedder voyage   # voyage-3.5-lite
 ```
@@ -179,8 +180,9 @@ rather than assumed:
   document lacks, and comments have no `title`. See `ARTICLE_FRAGMENT` in
   `indexer/src/meili.rs` — and note that adding a `doc.type` check there would
   *break* the exclusion, not tighten it. A unit test guards this.
-- Fragments are `rest`-only, so the local HuggingFace embedder is not offered:
-  it could only embed everything, comments included.
+- Fragments are `rest`-only, so a plain local HuggingFace embedder is not
+  offered: it could only embed everything, comments included. `granite` gets
+  local query embedding anyway, through a composite embedder (below).
 
 The command makes one embedding call itself before configuring anything. That
 measures the vector size (fragments require an explicit `dimensions`) and
@@ -188,11 +190,46 @@ fails fast on a bad key or model instead of leaving a broken embedder behind.
 It returns the settings task uid without waiting — that task also embeds every
 existing story, which on the full corpus runs for hours.
 
+### `granite`: GPU for documents, local model for queries
+
+`hn-indexer embedder granite` configures a **composite** embedder around
+[`ibm-granite/granite-embedding-107m-multilingual`](https://huggingface.co/ibm-granite/granite-embedding-107m-multilingual)
+(384 dimensions, multilingual, pinned to revision `d6cffd33`):
+
+- **Indexing** goes through LUMEN (`/v1/embeddings`, model
+  `granite-embedding-107m-multilingual`) to a Hugging Face TEI endpoint on a
+  GPU, batched, with the same comment-skipping fragment as the other kinds.
+- **Search** runs the same model inside Meilisearch, so queries make no
+  network call (~15 ms median on an M1 Pro) and the GPU endpoint can scale to
+  zero between indexing runs.
+
+Both halves must produce the same vectors, and that was measured rather than
+assumed (Meilisearch v1.54): Meilisearch's local model and
+sentence-transformers — which TEI reimplements, CLS pooling — agree to
+cosine ≥ 0.998 on English, French and German text. Fragments, batching,
+partial updates and `/similar` were also checked against a composite
+embedder: comments are never sent upstream, score/edit updates re-embed
+nothing, and searches make zero upstream calls. `granite_embedder()` in
+`indexer/src/meili.rs` records the details.
+
+Deployment requirements:
+
+- **TEI endpoint** must run with `AUTO_TRUNCATE=true`: the fragment keeps up to
+  400 words of article text, more than the model's 512 tokens.
+- **Meilisearch rejects private IPs in embedder URLs** ("bad uri: Rejected
+  URI"). To reach LUMEN over loopback on the same box instead of the public
+  hostname (and its Caddy edge rate limit), start Meilisearch with
+  `MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS=127.0.0.1/32` and set
+  `EMBEDDER_URL=http://127.0.0.1:8080/v1/embeddings`.
+- The command refuses to configure anything if the gateway returns vectors
+  that are not 384-dimensional: that means LUMEN is not serving this model,
+  and the two halves would not share a vector space.
+
 | Env var | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` / `VOYAGE_API_KEY` | — | Provider key (required) |
-| `OPENAI_EMBED_MODEL` / `VOYAGE_EMBED_MODEL` | `text-embedding-3-small` / `voyage-3.5-lite` | Model |
-| `EMBEDDER_URL` | provider endpoint | Any OpenAI-compatible embeddings endpoint |
+| `LUMEN_API_KEY` / `OPENAI_API_KEY` / `VOYAGE_API_KEY` | — | Gateway virtual key / provider key (required) |
+| `GRANITE_EMBED_MODEL` / `OPENAI_EMBED_MODEL` / `VOYAGE_EMBED_MODEL` | `granite-embedding-107m-multilingual` / `text-embedding-3-small` / `voyage-3.5-lite` | Model |
+| `EMBEDDER_URL` | provider endpoint (`granite`: `https://lumen.meilisearch.com/v1/embeddings`) | Any OpenAI-compatible embeddings endpoint |
 | `EMBEDDER_DIMENSIONS` | probed | Skip the probe call |
 
 Once embeddings exist, the UI shows a **✦ semantic** toggle (set
