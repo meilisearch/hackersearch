@@ -3,6 +3,53 @@ use serde_json::json;
 
 pub const INDEX_UID: &str = "hn";
 
+/// Bumped whenever the extraction pipeline changes in a way that makes
+/// already-stored `content` worth replacing. Documents carry the generation
+/// they were enriched under in `enrich_gen`; `enrich` re-processes anything
+/// stamped with an older one (or nothing at all — which covers both
+/// never-enriched documents and those written before this field existed,
+/// when the marker was a bare `enriched: true`).
+///
+/// History: 2 = Cloudflare-first crawl; 3 = local-first crawl that also
+/// stores the page's own `description`.
+pub const ENRICH_GENERATION: u32 = 3;
+
+/// What gets embedded for each document: the title, plus the page's own
+/// description and the crawled article text when there are some. Comments are
+/// never embedded.
+///
+/// How comments are excluded is load-bearing and non-obvious, so read this
+/// before touching the template. Measured on Meilisearch v1.49:
+///
+/// - A fragment is SKIPPED for a document only when it outputs (`{{ … }}`) a
+///   field that document does not have. HN comments have no `title` (hn.rs
+///   only ever sets it from the API's `title`), so `{{ doc.title }}` is what
+///   keeps every comment out of the vector store.
+/// - A fragment that merely renders to an EMPTY string is NOT skipped — the
+///   document is embedded as "". So wrapping this in
+///   `{% if doc.type != "comment" %}…{% endif %}` looks like a stricter guard
+///   but does the opposite: every comment would be embedded as the same empty
+///   vector, tens of millions of identical points that surface together in
+///   semantic search. Same reason `documentTemplate` can't be used at all.
+/// - A missing field inside a false `{% if %}` branch does not trigger the
+///   skip, which is why never-crawled stories (no `content`) still embed
+///   their title.
+///
+/// `content` and `description` are tri-state (absent / "" / text) and Liquid
+/// treats "" as truthy, hence the explicit `!= ""`. Both sit inside `{% if %}`
+/// branches, so a story missing either still embeds its title.
+pub const ARTICLE_FRAGMENT: &str = "{{ doc.title }}\
+{% if doc.description and doc.description != \"\" %}\n{{ doc.description }}{% endif %}\
+{% if doc.content and doc.content != \"\" %}\n{{ doc.content | truncatewords: 400 }}{% endif %}";
+
+/// A story waiting to be enriched.
+pub struct Enrichable {
+    pub id: u64,
+    pub url: String,
+    /// Used to discard page descriptions that only repeat the title.
+    pub title: Option<String>,
+}
+
 pub struct Meili {
     client: reqwest::Client,
     base: String,
@@ -88,6 +135,8 @@ impl Meili {
                   "features": { "facetSearch": true, "filter": { "equality": true, "comparison": false } } },
                 { "attributePatterns": ["type", "tags", "url", "enriched", "parent"],
                   "features": { "facetSearch": false, "filter": { "equality": true, "comparison": false } } },
+                { "attributePatterns": ["enrich_gen"],
+                  "features": { "facetSearch": false, "filter": { "equality": true, "comparison": true } } },
                 { "attributePatterns": ["points", "num_comments", "created_at"],
                   "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
             ],
@@ -192,11 +241,33 @@ impl Meili {
         }
     }
 
-    /// Fetch (id, url) pairs of documents that still need enrichment.
-    pub async fn fetch_enrichable(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+    /// Fetch (id, url) pairs of documents that still need enrichment:
+    /// link stories stamped with an older `enrich_gen` than the current one,
+    /// optionally limited to those created at or after `since` (unix secs).
+    ///
+    /// Only `type = "story"`: comments carry no URL, and job posts do link
+    /// out — but to careers pages, which are not articles and would only add
+    /// noise to the embeddings. Show HN links are stories, so they're kept;
+    /// Ask HN posts are stories without a URL, so `url EXISTS` drops them.
+    ///
+    /// Documents drop out of this filter as they are stamped, so the caller
+    /// can keep pulling batches until it comes back empty — no pagination
+    /// cursor, and re-runs resume wherever the last one stopped.
+    pub async fn fetch_enrichable(
+        &self,
+        limit: usize,
+        since: Option<i64>,
+    ) -> Result<Vec<Enrichable>> {
+        let mut filter = format!(
+            "type = \"story\" AND url EXISTS \
+             AND (enrich_gen NOT EXISTS OR enrich_gen < {ENRICH_GENERATION})"
+        );
+        if let Some(since) = since {
+            filter.push_str(&format!(" AND created_at >= {since}"));
+        }
         let body = json!({
-            "filter": "url EXISTS AND enriched NOT EXISTS AND type != \"comment\"",
-            "fields": ["id", "url"],
+            "filter": filter,
+            "fields": ["id", "url", "title"],
             "limit": limit,
         });
         let resp: serde_json::Value = self
@@ -214,40 +285,127 @@ impl Meili {
         let results = resp["results"].as_array().cloned().unwrap_or_default();
         Ok(results
             .into_iter()
-            .filter_map(|doc| Some((doc["id"].as_u64()?, doc["url"].as_str()?.to_string())))
+            .filter_map(|doc| {
+                Some(Enrichable {
+                    id: doc["id"].as_u64()?,
+                    url: doc["url"].as_str()?.to_string(),
+                    title: doc["title"].as_str().map(str::to_string),
+                })
+            })
             .collect())
     }
 
     /// Configure the `default` embedder used for semantic/hybrid search.
-    /// The document template prefers the enriched article content over the
-    /// item's own text, mirroring the hackerverse approach.
-    pub async fn apply_embedder(&self, kind: &str) -> Result<()> {
-        let template = "{{ doc.type }}: {% if doc.title %}{{ doc.title }}\n{% endif %}\
-            {% if doc.content %}{{ doc.content | truncatewords: 400 }}\
-            {% elsif doc.text %}{{ doc.text | truncatewords: 200 }}{% endif %}";
-        let embedder = match kind {
-            "huggingface" => json!({
-                "source": "huggingFace",
-                "documentTemplate": template,
-            }),
-            "openai" => json!({
-                "source": "openAi",
-                "model": "text-embedding-3-small",
-                "apiKey": std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                "documentTemplate": template,
-            }),
-            other => anyhow::bail!("unknown embedder '{other}' (huggingface|openai)"),
+    ///
+    /// Touches only the `embedders` setting (plus the `multimodal`
+    /// experimental feature that fragments need), never the rest of the
+    /// index settings — so it is safe on an index where `apply_settings()`
+    /// would trigger a full reindex.
+    ///
+    /// Comments are never embedded; see [`ARTICLE_FRAGMENT`] for how that is
+    /// enforced and why it has to be done the way it is.
+    ///
+    /// Returns the uid of the settings task, which is where embedding
+    /// progress and failures show up.
+    pub async fn apply_embedder(&self, kind: &str) -> Result<Option<u64>> {
+        let (default_url, model_var, default_model, key_var) = match kind {
+            "openai" => (
+                "https://api.openai.com/v1/embeddings",
+                "OPENAI_EMBED_MODEL",
+                "text-embedding-3-small",
+                "OPENAI_API_KEY",
+            ),
+            "voyage" => (
+                "https://api.voyageai.com/v1/embeddings",
+                "VOYAGE_EMBED_MODEL",
+                "voyage-3.5-lite",
+                "VOYAGE_API_KEY",
+            ),
+            // Meilisearch only supports indexing fragments on the `rest`
+            // source; a huggingFace embedder can only use documentTemplate,
+            // which embeds every document — comments included.
+            "huggingface" => anyhow::bail!(
+                "the local huggingFace embedder cannot skip comments \
+                 (indexing fragments are rest-only) — use openai or voyage"
+            ),
+            other => anyhow::bail!("unknown embedder '{other}' (openai|voyage)"),
         };
-        self.request(
-            reqwest::Method::PATCH,
-            &format!("/indexes/{INDEX_UID}/settings"),
-        )
-        .json(&json!({ "embedders": { "default": embedder } }))
-        .send()
-        .await?
-        .error_for_status()
-        .context("applying embedder settings")?;
-        Ok(())
+        let non_empty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        let api_key =
+            non_empty(key_var).with_context(|| format!("embedder '{kind}' needs {key_var}"))?;
+        let model = non_empty(model_var).unwrap_or_else(|| default_model.to_string());
+        // Any OpenAI-compatible endpoint works (e.g. a self-hosted gateway).
+        let url = non_empty("EMBEDDER_URL").unwrap_or_else(|| default_url.to_string());
+
+        // Meilisearch cannot infer `dimensions` for an embedder that uses
+        // indexing fragments, so measure it with one real call. That call
+        // doubles as a credential check: a bad key or model fails here, on
+        // the operator's terminal, instead of as a failed settings task
+        // after Meilisearch has already swapped in a broken embedder.
+        let dimensions = match non_empty("EMBEDDER_DIMENSIONS") {
+            Some(d) => d
+                .parse::<usize>()
+                .context("EMBEDDER_DIMENSIONS must be an integer")?,
+            None => self.probe_dimensions(&url, &api_key, &model).await?,
+        };
+        tracing::info!("embedder: {url} model={model} dimensions={dimensions}");
+
+        // Indexing/search fragments are gated behind this experimental flag.
+        self.request(reqwest::Method::PATCH, "/experimental-features")
+            .json(&json!({ "multimodal": true }))
+            .send()
+            .await?
+            .error_for_status()
+            .context("enabling the multimodal experimental feature")?;
+
+        let embedder = json!({
+            "source": "rest",
+            "url": url,
+            "apiKey": api_key,
+            "dimensions": dimensions,
+            "request": { "model": model, "input": "{{fragment}}" },
+            "response": { "data": [{ "embedding": "{{embedding}}" }] },
+            "indexingFragments": { "article": { "value": ARTICLE_FRAGMENT } },
+            "searchFragments": { "query": { "value": "{{ q }}" } },
+        });
+        let task = self
+            .request(
+                reqwest::Method::PATCH,
+                &format!("/indexes/{INDEX_UID}/settings"),
+            )
+            .json(&json!({ "embedders": { "default": embedder } }))
+            .send()
+            .await?
+            .error_for_status()
+            .context("applying embedder settings")?
+            .json::<serde_json::Value>()
+            .await?;
+        // Deliberately not waited on: this one task also embeds every story
+        // already in the index, which on the full corpus runs for hours.
+        let uid = task["taskUid"].as_u64();
+        Ok(uid)
+    }
+
+    /// Embed a throwaway string once and return the vector's length.
+    async fn probe_dimensions(&self, url: &str, api_key: &str, model: &str) -> Result<usize> {
+        let resp = self
+            .client
+            .post(url)
+            .bearer_auth(api_key)
+            .json(&json!({ "model": model, "input": "dimension probe" }))
+            .send()
+            .await
+            .with_context(|| format!("reaching embedding endpoint {url}"))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("embedding endpoint returned {status}: {body}");
+        }
+        body["data"][0]["embedding"]
+            .as_array()
+            .map(|v| v.len())
+            .filter(|&n| n > 0)
+            .with_context(|| format!("no embedding in probe response: {body}"))
     }
 
     pub async fn document_count(&self) -> Result<u64> {
@@ -259,5 +417,26 @@ impl Meili {
             .json()
             .await?;
         Ok(stats["numberOfDocuments"].as_u64().unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Comment exclusion depends on the fragment OUTPUTTING `doc.title`
+    /// unconditionally — see ARTICLE_FRAGMENT. A type-based `{% if %}` guard
+    /// would make Meilisearch embed every comment as "" instead of skipping it.
+    #[test]
+    fn article_fragment_gates_comments_on_title() {
+        assert!(ARTICLE_FRAGMENT.starts_with("{{ doc.title }}"));
+        assert!(
+            !ARTICLE_FRAGMENT.contains("doc.type"),
+            "a type-based guard embeds comments as empty strings rather than skipping them"
+        );
+        assert!(
+            !ARTICLE_FRAGMENT.contains("doc.text"),
+            "comment text must never be embedded"
+        );
     }
 }

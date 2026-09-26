@@ -69,9 +69,16 @@ struct Cli {
 enum Command {
     /// Create the index and apply search settings
     Settings {
-        /// Also configure an embedder for semantic search: huggingface | openai
+        /// Also configure an embedder for semantic search: openai | voyage
         #[arg(long)]
         embedder: Option<String>,
+    },
+    /// Configure ONLY the embedder (openai | voyage), leaving every other
+    /// index setting untouched. Use this on an existing production index,
+    /// where `settings` would push the whole definition and reindex.
+    Embedder {
+        /// openai | voyage
+        kind: String,
     },
     /// Fetch the pages stories link to and store extracted article text on
     /// the documents (embedding fodder — not full-text indexed)
@@ -82,10 +89,29 @@ enum Command {
         /// Stop after attempting this many documents (useful for testing)
         #[arg(long)]
         limit: Option<u64>,
-        /// Page extractor: auto (cloudflare when CLOUDFLARE_ACCOUNT_ID +
-        /// CLOUDFLARE_API_TOKEN are set, else local), local, or cloudflare
+        /// Page extractor. Every page is fetched and extracted locally first
+        /// (free); `auto` adds a Cloudflare browser-render fallback for pages
+        /// that yield no text when CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN
+        /// are set, `cloudflare` requires them, `local` never uses them
         #[arg(long, env = "ENRICH_EXTRACTOR", default_value = "auto")]
         extractor: String,
+        /// Only enrich stories posted on or after this date (YYYY-MM-DD)
+        #[arg(long, env = "ENRICH_SINCE")]
+        since: Option<String>,
+        /// Only enrich stories posted in the last N days
+        #[arg(long, conflicts_with = "since")]
+        since_days: Option<u64>,
+        /// Keep running once the backlog drains, picking up newly indexed
+        /// stories every --interval seconds instead of exiting
+        #[arg(long, env = "ENRICH_WATCH")]
+        watch: bool,
+        /// Poll interval for --watch, in seconds
+        #[arg(long, env = "ENRICH_INTERVAL", default_value_t = 60)]
+        interval: u64,
+        /// Concurrent Cloudflare renders. Raise it to your plan's limit; 429s
+        /// are retried with backoff, so overshooting slows down, not fails.
+        #[arg(long, env = "ENRICH_CF_CONCURRENCY", default_value_t = 6)]
+        cf_concurrency: usize,
     },
     /// Index items from --from (default: current maxitem) down to --to (default: 1)
     Backfill {
@@ -117,6 +143,21 @@ enum Command {
         /// Poll interval for live sync, in seconds
         #[arg(long, env = "SYNC_INTERVAL", default_value_t = 30)]
         interval: u64,
+        /// Also enrich story content continuously, alongside backfill and
+        /// sync, so newly indexed stories get article text without a
+        /// separate `enrich` invocation.
+        #[arg(long, env = "ENRICH_ON_SYNC")]
+        enrich: bool,
+        /// Floor for --enrich, as a date (YYYY-MM-DD). Older stories are
+        /// left alone — crawling the full corpus is a multi-day job.
+        #[arg(long, env = "ENRICH_SINCE")]
+        enrich_since: Option<String>,
+        /// Max characters of extracted content to keep, for --enrich
+        #[arg(long, env = "ENRICH_MAX_CHARS", default_value_t = 4000)]
+        enrich_max_chars: usize,
+        /// Concurrent Cloudflare renders, for --enrich
+        #[arg(long, env = "ENRICH_CF_CONCURRENCY", default_value_t = 6)]
+        enrich_cf_concurrency: usize,
     },
 }
 
@@ -282,113 +323,331 @@ async fn resolve_backfill_range(
     Ok(Some((from, to)))
 }
 
-/// Repeatedly pull un-enriched story documents from the index, fetch the
-/// pages they link to, extract the main article text, and write it back as
-/// a partial document update ({id, content, enriched}). Failed fetches are
-/// still marked `enriched` so they aren't retried forever.
+/// Per-batch tally of how pages were obtained, so each batch's log line says
+/// why it was slow or failing — throttling, timeouts, or plain slow renders —
+/// rather than only how many pages came back.
+#[derive(Default)]
+struct BatchStats {
+    cf_attempts: u64,
+    cf_content: u64,
+    cf_empty: u64,
+    cf_throttled: u64,
+    cf_http: u64,
+    /// Which non-429 statuses came back, and how often.
+    cf_http_codes: std::collections::BTreeMap<u16, u64>,
+    cf_timeout: u64,
+    cf_transport: u64,
+    throttled_retries: u64,
+    cf_secs: f64,
+    local_attempts: u64,
+    local_content: u64,
+}
+
+impl BatchStats {
+    fn record_cloudflare(&mut self, attempt: &enrich::CfAttempt) {
+        self.cf_attempts += 1;
+        self.throttled_retries += u64::from(attempt.throttled_retries);
+        self.cf_secs += attempt.elapsed.as_secs_f64();
+        match &attempt.outcome {
+            enrich::CfOutcome::Content(_) => self.cf_content += 1,
+            enrich::CfOutcome::Empty => self.cf_empty += 1,
+            enrich::CfOutcome::Throttled => self.cf_throttled += 1,
+            enrich::CfOutcome::Http(code) => {
+                self.cf_http += 1;
+                *self.cf_http_codes.entry(*code).or_default() += 1;
+            }
+            enrich::CfOutcome::Timeout => self.cf_timeout += 1,
+            enrich::CfOutcome::Transport => self.cf_transport += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &BatchStats) {
+        self.cf_attempts += other.cf_attempts;
+        self.cf_content += other.cf_content;
+        self.cf_empty += other.cf_empty;
+        self.cf_throttled += other.cf_throttled;
+        self.cf_http += other.cf_http;
+        for (code, n) in &other.cf_http_codes {
+            *self.cf_http_codes.entry(*code).or_default() += n;
+        }
+        self.cf_timeout += other.cf_timeout;
+        self.cf_transport += other.cf_transport;
+        self.throttled_retries += other.throttled_retries;
+        self.cf_secs += other.cf_secs;
+        self.local_attempts += other.local_attempts;
+        self.local_content += other.local_content;
+    }
+
+    fn summary(&self, cloudflare: bool) -> String {
+        let local = format!(", local {}/{} ok", self.local_content, self.local_attempts);
+        if !cloudflare || self.cf_attempts == 0 {
+            return local;
+        }
+        let avg = self.cf_secs / self.cf_attempts as f64;
+        let codes = if self.cf_http_codes.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = self
+                .cf_http_codes
+                .iter()
+                .map(|(code, n)| format!("{code}×{n}"))
+                .collect();
+            format!(" ({})", list.join(", "))
+        };
+        format!(
+            "{local}, cloudflare fallback {} ok / {} empty / {} throttled-out / \
+             {} http-err{codes} / {} timeout / {} transport, {} retries on 429, \
+             avg {avg:.1}s per render",
+            self.cf_content,
+            self.cf_empty,
+            self.cf_throttled,
+            self.cf_http,
+            self.cf_timeout,
+            self.cf_transport,
+            self.throttled_retries,
+        )
+    }
+}
+
+/// Repeatedly pull story documents needing enrichment, fetch the pages they
+/// link to, extract the main article text, and write it back as a partial
+/// document update ({id, content, enrich_gen}). Failed fetches are still
+/// stamped with the generation so they aren't retried forever.
+///
+/// `since` limits the work to stories created at or after that unix second;
+/// `watch` keeps the loop alive once the backlog drains, re-polling at that
+/// interval so stories indexed later get enriched too.
 async fn enrich_loop(
     ctx: &Ctx,
     max_chars: usize,
     limit: Option<u64>,
     cloudflare: Option<enrich::Cloudflare>,
+    since: Option<i64>,
+    watch: Option<Duration>,
+    cf_concurrency: usize,
 ) -> Result<()> {
+    // Plain fetches must fail fast — a slow server shouldn't hold a slot the
+    // next page could use — while a browser render legitimately takes tens
+    // of seconds. Hence two clients with different timeouts.
     let pages = reqwest::Client::builder()
-        .timeout(Duration::from_secs(if cloudflare.is_some() {
-            60
-        } else {
-            15
-        }))
+        .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent("HackerSearchBot/0.1 (article-content enrichment)")
         .build()?;
-    // Browser rendering is a scarcer resource than plain GETs.
-    let fetch_concurrency = if cloudflare.is_some() {
-        ctx.concurrency.min(6)
-    } else {
-        ctx.concurrency.min(32)
-    };
+    let renders = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    // Every page gets the free local fetch first; a plain GET handles the
+    // large majority of HN links. Only pages it can't extract (JS shells, bot
+    // walls) go to Cloudflare, which bills per render. Its plan-bound
+    // concurrency is enforced with a semaphore, so it caps the renders
+    // without throttling the local fetches down to the same number.
+    let fetch_concurrency = ctx.concurrency.min(32);
+    let cf_concurrency = cf_concurrency.max(1);
+    let cf_permits = Arc::new(tokio::sync::Semaphore::new(cf_concurrency));
+    // Nothing is written back until a whole batch finishes, so the batch is
+    // the unit of both progress logging and loss on restart; this keeps both
+    // to roughly a minute.
+    let max_batch: u64 = 250;
     info!(
-        "enrich: extractor = {}",
+        "enrich: extractor = {} (fetch concurrency {fetch_concurrency}, batches of {max_batch})",
         if cloudflare.is_some() {
-            "cloudflare browser rendering (local fallback)"
+            format!("local first, cloudflare fallback ({cf_concurrency} concurrent renders)")
         } else {
-            "local"
+            "local only".to_string()
         }
     );
 
     let started = Instant::now();
     let mut attempted: u64 = 0;
     let mut extracted: u64 = 0;
+    let mut described: u64 = 0;
 
     loop {
         let batch_size = match limit {
-            Some(cap) => (cap - attempted).min(500) as usize,
-            None => 500,
+            Some(cap) => (cap - attempted).min(max_batch) as usize,
+            None => max_batch as usize,
         };
         if batch_size == 0 {
             break;
         }
-        let batch = ctx.meili.fetch_enrichable(batch_size).await?;
+        let batch = ctx.meili.fetch_enrichable(batch_size, since).await?;
         if batch.is_empty() {
-            break;
+            // Nothing eligible right now. In watch mode that just means the
+            // backlog is drained — wait for sync to index more and re-poll.
+            match watch {
+                Some(interval) => {
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+                None => break,
+            }
         }
         let batch_len = batch.len() as u64;
 
-        let updates: Vec<serde_json::Value> = stream::iter(batch)
-            .map(|(id, url)| {
+        let crawl_started = Instant::now();
+        let results: Vec<(serde_json::Value, BatchStats)> = stream::iter(batch)
+            .map(|story| {
                 let pages = pages.clone();
+                let renders = renders.clone();
                 let cloudflare = cloudflare.clone();
+                let cf_permits = cf_permits.clone();
                 async move {
-                    // Prefer the rendered-browser markdown when available;
-                    // fall back to a plain fetch + local extraction.
-                    let mut content = match &cloudflare {
-                        Some(cf) => enrich::markdown_via_cloudflare(&pages, cf, &url, max_chars)
-                            .await
-                            .unwrap_or_default(),
-                        None => None,
+                    let mut stats = BatchStats::default();
+                    let url = &story.url;
+                    // 1. Plain fetch + local extraction. Free, and it yields
+                    //    the page's own description even when the body is a
+                    //    JavaScript shell with no text to extract.
+                    let page = match enrich::fetch_page(&pages, url).await {
+                        Ok(Some(html)) => Some(enrich::extract_page(
+                            &html,
+                            max_chars,
+                            story.title.as_deref(),
+                        )),
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::debug!("enrich: fetch failed for {url}: {e:#}");
+                            None
+                        }
                     };
+                    let (mut content, description) =
+                        page.map_or((None, None), |p| (p.content, p.description));
+                    stats.local_attempts += 1;
+                    stats.local_content += u64::from(content.is_some());
+
+                    // 2. Only what the plain fetch couldn't extract is sent to
+                    //    the billed browser.
                     if content.is_none() {
-                        content = match enrich::fetch_page(&pages, &url).await {
-                            Ok(Some(html)) => enrich::extract_content(&html, max_chars),
-                            Ok(None) => None,
-                            Err(e) => {
-                                tracing::debug!("enrich: fetch failed for {url}: {e:#}");
-                                None
+                        if let Some(cf) = &cloudflare {
+                            let _permit = cf_permits
+                                .acquire()
+                                .await
+                                .expect("semaphore is never closed");
+                            let attempt =
+                                enrich::markdown_via_cloudflare(&renders, cf, url, max_chars).await;
+                            stats.record_cloudflare(&attempt);
+                            if let enrich::CfOutcome::Content(text) = attempt.outcome {
+                                content = Some(text);
                             }
-                        };
+                        }
                     }
-                    let mut update = serde_json::json!({ "id": id, "enriched": true });
-                    if let Some(content) = content {
-                        update["content"] = content.into();
-                    }
-                    update
+
+                    // `content` and `description` are deliberately tri-state:
+                    //   absent      — never attempted
+                    //   ""          — attempted, nothing extractable
+                    //   non-empty   — extracted text
+                    // Writing "" (rather than leaving the field off) is what
+                    // makes a permanent extraction failure distinguishable
+                    // from a story the crawler has not reached yet.
+                    let update = serde_json::json!({
+                        "id": story.id,
+                        "enrich_gen": meili::ENRICH_GENERATION,
+                        "content": content.unwrap_or_default(),
+                        "description": description.unwrap_or_default(),
+                    });
+                    (update, stats)
                 }
             })
             .buffer_unordered(fetch_concurrency)
             .collect()
             .await;
+        let crawl_secs = crawl_started.elapsed().as_secs_f64();
+        let mut stats = BatchStats::default();
+        let updates: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|(update, doc_stats)| {
+                stats.merge(&doc_stats);
+                update
+            })
+            .collect();
 
-        extracted += updates
-            .iter()
-            .filter(|u| u.get("content").is_some())
-            .count() as u64;
+        let non_empty = |field: &str| {
+            updates
+                .iter()
+                .filter(|u| u[field].as_str().is_some_and(|v| !v.is_empty()))
+                .count() as u64
+        };
+        extracted += non_empty("content");
+        described += non_empty("description");
         attempted += batch_len;
 
-        // The next fetch_enrichable relies on the `enriched` flag being
-        // visible, so wait for the update task to finish.
+        // The next fetch_enrichable relies on the `enrich_gen` stamps being
+        // visible, so wait for the update task to finish. On a busy index this
+        // wait can dominate the batch — it sits behind every queued task —
+        // which is why it is timed separately from the crawl.
+        let write_started = Instant::now();
         if let Some(task) = ctx.meili.add_documents(&updates).await? {
             ctx.meili.wait_for_task(task).await?;
         }
+        let write_secs = write_started.elapsed().as_secs_f64();
 
         let rate = attempted as f64 / started.elapsed().as_secs_f64().max(0.001);
-        info!("enrich: {attempted} attempted, {extracted} with content ({rate:.0} docs/s)");
+        info!(
+            "enrich: {attempted} attempted, {extracted} with content, {described} with \
+             description ({rate:.2} docs/s) \
+             | batch: crawl {crawl_secs:.0}s, write+wait {write_secs:.0}s{}",
+            stats.summary(cloudflare.is_some())
+        );
+        if cloudflare.is_some()
+            && stats.cf_attempts > 0
+            && stats.throttled_retries * 4 > stats.cf_attempts
+        {
+            warn!(
+                "enrich: Cloudflare is throttling ({} 429s over {} renders) — \
+                 lower ENRICH_CF_CONCURRENCY",
+                stats.throttled_retries, stats.cf_attempts
+            );
+        }
     }
 
     info!(
-        "enrich complete: {extracted}/{attempted} documents got article content in {:?}",
+        "enrich complete: {extracted}/{attempted} documents got article content, \
+         {described} a description, in {:?}",
         started.elapsed()
     );
     Ok(())
+}
+
+/// Resolve the `--since` / `--since-days` pair into a unix-seconds floor.
+fn resolve_since(since: Option<&str>, since_days: Option<u64>) -> Result<Option<i64>> {
+    if let Some(date) = since {
+        return Ok(Some(parse_date(date)?));
+    }
+    if let Some(days) = since_days {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        return Ok(Some(now - (days as i64) * 86_400));
+    }
+    Ok(None)
+}
+
+/// Parse `YYYY-MM-DD` into the unix second of its UTC midnight.
+fn parse_date(raw: &str) -> Result<i64> {
+    let parts: Vec<&str> = raw.split('-').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("expected a date as YYYY-MM-DD, got '{raw}'");
+    }
+    let year: i64 = parts[0].parse().context("parsing year")?;
+    let month: i64 = parts[1].parse().context("parsing month")?;
+    let day: i64 = parts[2].parse().context("parsing day")?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        anyhow::bail!("'{raw}' is not a valid date");
+    }
+    Ok(days_from_civil(year, month, day) * 86_400)
+}
+
+/// Days from 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`) — exact, and cheaper than a date-library dependency
+/// for the one date this binary needs to parse.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Binary-search the lowest item id created at or after `cutoff`. HN ids are
@@ -465,17 +724,30 @@ async fn main() -> Result<()> {
         Command::Settings { embedder } => {
             ctx.meili.apply_settings().await?;
             if let Some(kind) = embedder {
-                ctx.meili.apply_embedder(&kind).await?;
+                let _ = ctx.meili.apply_embedder(&kind).await?;
                 info!(
                     "embedder '{kind}' configured — Meilisearch is now (re)embedding all documents"
                 );
             }
             info!("index '{}' configured", meili::INDEX_UID);
         }
+        Command::Embedder { kind } => {
+            let task = ctx.meili.apply_embedder(&kind).await?;
+            info!(
+                "embedder '{kind}' submitted as task {} — Meilisearch is now embedding \
+                 stories (never comments); follow it with GET /tasks/<uid>",
+                task.map_or("?".to_string(), |t| t.to_string())
+            );
+        }
         Command::Enrich {
             max_chars,
             limit,
             extractor,
+            since,
+            since_days,
+            watch,
+            interval,
+            cf_concurrency,
         } => {
             let cloudflare = match extractor.as_str() {
                 "local" => None,
@@ -487,8 +759,21 @@ async fn main() -> Result<()> {
                 "auto" => enrich::Cloudflare::from_env(),
                 other => anyhow::bail!("unknown extractor '{other}' (auto|local|cloudflare)"),
             };
+            let since = resolve_since(since.as_deref(), since_days)?;
+            if let Some(floor) = since {
+                info!("enrich: limited to stories created at or after {floor} (unix)");
+            }
             ctx.meili.ensure_index().await?;
-            enrich_loop(&ctx, max_chars, limit, cloudflare).await?;
+            enrich_loop(
+                &ctx,
+                max_chars,
+                limit,
+                cloudflare,
+                since,
+                watch.then(|| Duration::from_secs(interval)),
+                cf_concurrency,
+            )
+            .await?;
         }
         Command::Backfill {
             from,
@@ -529,7 +814,14 @@ async fn main() -> Result<()> {
             ctx.meili.ensure_index().await?;
             sync(&ctx, interval).await?;
         }
-        Command::Run { recent, interval } => {
+        Command::Run {
+            recent,
+            interval,
+            enrich: enrich_enabled,
+            enrich_since,
+            enrich_max_chars,
+            enrich_cf_concurrency,
+        } => {
             ctx.meili.ensure_index().await?;
             let max = hn::max_item(&ctx.hn).await?;
             let to = recent.map(|n| max.saturating_sub(n).max(1)).unwrap_or(1);
@@ -554,12 +846,138 @@ async fn main() -> Result<()> {
                 }
             });
 
+            // Enrichment, when enabled, runs forever in watch mode: it
+            // drains whatever is eligible, then re-polls so stories the sync
+            // loop indexes later get article text without a second command.
+            let enrich_task = if enrich_enabled {
+                let since = resolve_since(enrich_since.as_deref(), None)?;
+                let cloudflare = enrich::Cloudflare::from_env();
+                info!(
+                    "enrich-on-sync enabled (extractor = {}, floor = {})",
+                    if cloudflare.is_some() {
+                        "cloudflare"
+                    } else {
+                        "local"
+                    },
+                    since.map_or("none".to_string(), |s| s.to_string())
+                );
+                let enrich_ctx = ctx.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = enrich_loop(
+                            &enrich_ctx,
+                            enrich_max_chars,
+                            None,
+                            cloudflare.clone(),
+                            since,
+                            Some(Duration::from_secs(60)),
+                            enrich_cf_concurrency,
+                        )
+                        .await
+                        {
+                            warn!("enrich failed, retrying in 60s: {e:#}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                }))
+            } else {
+                None
+            };
+
             // Sync runs forever; backfill finishes in the background.
             let sync_result = sync(&ctx, interval).await;
             backfill_task.abort();
+            if let Some(task) = enrich_task {
+                task.abort();
+            }
             sync_result?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(outcome: enrich::CfOutcome, retries: u32, secs: u64) -> enrich::CfAttempt {
+        enrich::CfAttempt {
+            outcome,
+            throttled_retries: retries,
+            elapsed: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn batch_stats_attribute_every_outcome() {
+        let mut batch = BatchStats::default();
+        for a in [
+            attempt(enrich::CfOutcome::Content("x".into()), 0, 3),
+            attempt(enrich::CfOutcome::Content("y".into()), 1, 5),
+            attempt(enrich::CfOutcome::Throttled, 4, 32),
+            attempt(enrich::CfOutcome::Http(422), 0, 1),
+            attempt(enrich::CfOutcome::Http(422), 0, 1),
+            attempt(enrich::CfOutcome::Timeout, 0, 60),
+        ] {
+            let mut doc = BatchStats::default();
+            doc.record_cloudflare(&a);
+            batch.merge(&doc);
+        }
+        assert_eq!(batch.cf_attempts, 6);
+        assert_eq!(batch.cf_content, 2);
+        assert_eq!(batch.cf_throttled, 1);
+        assert_eq!(batch.throttled_retries, 5);
+        assert_eq!(batch.cf_timeout, 1);
+        let line = batch.summary(true);
+        assert!(line.contains("2 ok"), "{line}");
+        assert!(line.contains("http-err (422×2)"), "{line}");
+        assert!(line.contains("5 retries on 429"), "{line}");
+        // (3 + 5 + 32 + 1 + 1 + 60) / 6
+        assert!(line.contains("avg 17.0s"), "{line}");
+    }
+
+    #[test]
+    fn parses_dates_to_utc_midnight() {
+        assert_eq!(parse_date("1970-01-01").unwrap(), 0);
+        // The cutoff this project actually cares about.
+        assert_eq!(parse_date("2025-01-01").unwrap(), 1_735_689_600);
+        // Leap day: 59 whole days after 2024-01-01.
+        assert_eq!(
+            parse_date("2024-02-29").unwrap(),
+            parse_date("2024-01-01").unwrap() + 59 * 86_400
+        );
+        // Monotonic across a century boundary (2100 is not a leap year).
+        assert!(parse_date("2100-03-01").unwrap() > parse_date("2100-02-28").unwrap());
+    }
+
+    #[test]
+    fn rejects_malformed_dates() {
+        for bad in [
+            "2025",
+            "2025-01",
+            "2025-13-01",
+            "2025-01-32",
+            "not-a-date",
+            "",
+        ] {
+            assert!(parse_date(bad).is_err(), "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn since_prefers_explicit_date_and_defaults_to_none() {
+        assert_eq!(resolve_since(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_since(Some("2025-01-01"), None).unwrap(),
+            Some(1_735_689_600)
+        );
+        // --since-days is relative, so just assert it lands in the past.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let floor = resolve_since(None, Some(30)).unwrap().unwrap();
+        assert!(floor < now && floor > now - 31 * 86_400);
+    }
 }
