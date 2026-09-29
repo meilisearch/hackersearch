@@ -117,8 +117,7 @@ In production the indexer runs on **qdq-server** (a self-hosted Scaleway
 box), next to its Meilisearch, as two systemd units: `hn-indexer` (`sync`) and
 `hn-indexer-enrich` (`enrich --watch`). Their config and runbooks live in the
 [qdq-server](https://github.com/qdequele/qdq-server) repo under
-`meilisearch/`. `indexer/fly.toml` is left over from the earlier Fly.io
-deployment.
+`meilisearch/`.
 
 ## The indexes
 
