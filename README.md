@@ -41,10 +41,11 @@ new and updated items live every 30 seconds.
 ## Architecture
 
 ```
-┌─────────────┐   Firebase API    ┌────────────┐   REST    ┌─────────────┐
-│ Hacker News │ ────────────────▶ │ hn-indexer │ ────────▶ │ Meilisearch │
-└─────────────┘  backfill + sync  │   (Rust)   │           │  index: hn  │
-                                  └────────────┘           └──────┬──────┘
+┌─────────────┐   Firebase API    ┌────────────┐   REST    ┌──────────────┐
+│ Hacker News │ ────────────────▶ │ hn-indexer │ ────────▶ │ Meilisearch  │
+└─────────────┘  backfill + sync  │   (Rust)   │           │  hn-stories  │
+                                  └────────────┘           │  hn-comments │
+                                                           └──────┬───────┘
                                                         multi-search│
                                                            ┌───────▼──────┐
                                                            │  web (Next)  │
@@ -79,7 +80,7 @@ cargo run --release -- backfill
 ## The indexer
 
 ```
-hn-indexer settings                    # create index + apply search settings
+hn-indexer settings                    # create both indexes + apply search settings
 hn-indexer backfill [--recent N]       # index maxitem → 1 (or just last N ids)
 hn-indexer backfill --since-days 30    # index everything posted in the last N days
 hn-indexer sync [--interval 30]        # follow new + updated items forever
@@ -88,6 +89,7 @@ hn-indexer enrich                      # crawl story URLs, store extracted artic
 hn-indexer enrich --since 2025-01-01   # …only stories posted on or after a date
 hn-indexer enrich --watch              # …and keep going, picking up new stories
 hn-indexer embedder openai|voyage      # enable semantic search (stories only, never comments)
+hn-indexer split                       # one-time: migrate the old single `hn` index
 ```
 
 Deleted and dead items are skipped. Comment HTML is stripped at index time, so
@@ -111,20 +113,77 @@ documents are plain text and the UI never renders HTML from HN.
 | `CLOUDFLARE_ACCOUNT_ID` | — | Browser Rendering account (enables `auto` fallback) |
 | `CLOUDFLARE_API_TOKEN` | — | Browser Rendering token (enables `auto` fallback) |
 
-The production indexer runs on Fly.io as a long-lived `hn-indexer run` worker
-against Meilisearch Cloud — see [`indexer/fly.toml`](indexer/fly.toml).
+In production the indexer runs on **qdq-server** (a self-hosted Scaleway
+box), next to its Meilisearch, as two systemd units: `hn-indexer` (`sync`) and
+`hn-indexer-enrich` (`enrich --watch`). Their config and runbooks live in the
+[qdq-server](https://github.com/qdequele/qdq-server) repo under
+`meilisearch/`.
 
-## The index
+## The indexes
 
-Documents (`id` primary key): `type`, `tags` (`story`, `comment`, `ask_hn`,
-`show_hn`, `launch_hn`, `job`, …), `title`, `text`, `url`, `domain`, `author`,
-`points`, `num_comments`, `created_at` (unix seconds), `parent`, plus
-`content`, `description` and `enrich_gen` written by `enrich`.
+Items are split by type into two indexes, one per UI tab:
 
-- **Searchable**: title, text, url, domain, author
-- **Facets/filters**: tags, type, author, domain, points, num_comments,
+| Index | Holds | Share of corpus |
+|---|---|---|
+| `hn-stories` | stories, Ask/Show/Launch HN, jobs, polls, poll options | ~10% |
+| `hn-comments` | comments | ~90% |
+
+The tabs never mix the two, so nothing needs federated search. Splitting
+means a News query only expands prefixes and typos against story vocabulary
+and never loads posting lists padded with 40M comments. Each index is
+configured for exactly what its tab queries, and a settings or embedder
+change rebuilds one index instead of the whole corpus.
+
+Documents (`id` primary key): `type`, `tags` (`story`, `ask_hn`, `show_hn`,
+`launch_hn`, `job`, …), `title`, `text`, `url`, `domain`, `author`, `points`,
+`num_comments`, `created_at` (unix seconds), `parent`, plus `content`,
+`description` and `enrich_gen` written by `enrich` (stories only).
+
+**`hn-stories`**
+
+- **Searchable**: title, text
+- **Facets/filters**: tags, type, url, author, domain, points, num_comments,
   created_at, enrich_gen
 - **Sorts**: relevance (with a `points:desc` tiebreaker), newest, points
+
+**`hn-comments`**
+
+- **Searchable**: text
+- **Facets/filters**: author, parent (the thread walk), created_at. HN
+  exposes no comment scores, so there is no points filter on this tab.
+- **Sorts**: relevance, newest
+
+### Migrating from the single `hn` index
+
+Deployments from before the split hold everything in one `hn` index. The new
+indexer refuses to run against it and asks for a one-time migration:
+
+1. **Mint a search key** scoped to `["hn-stories", "hn-comments"]`. A key
+   scoped to `hn` stops matching anything once the index is renamed.
+2. **Stop every writer**: sync *and* enrichment. `split` pages through `hn` by
+   offset, so nothing else may write to it meanwhile.
+3. **Install the new binary and run `hn-indexer split`.** It is resumable;
+   run it somewhere that survives a dropped SSH session.
+4. **Deploy the web app** with the new key, as soon as `split` finishes.
+5. **Restart sync and enrichment.** Sync resumes from its checkpoint and
+   catches up whatever HN posted during the migration.
+
+On qdq-server, the exact commands are in the qdq-server repo,
+`meilisearch/README.md` → *Splitting the hn index*. Run it off-peak: the
+delete and the comment re-configuration each rewrite the large index, and
+Meilisearch's task queue is shared by every index on the instance.
+
+`split` copies the ~5M non-comment documents whole into `hn-stories`, so
+crawled `content` and `description` are kept. It checks the copy is
+complete, deletes those documents from `hn`, then renames `hn` to
+`hn-comments` in place, so the ~40M comments are never moved. Last, it
+submits the leaner comment settings as a background task, and searches keep
+working while that runs. The copy is checkpointed in `INDEXER_STATE_FILE`;
+re-running after an interruption picks up where it stopped, and re-running
+after it finished does nothing.
+
+Vectors are not copied. If `hn` had an embedder, `split` says so; run
+`hn-indexer embedder openai|voyage` afterwards to re-embed the stories.
 
 ## The web UI
 
@@ -239,27 +298,28 @@ the pass resumable and idempotent.
 </details>
 
 <details>
-<summary><strong>Embedder: why comments are never embedded</strong></summary>
+<summary><strong>Embedder: what gets embedded</strong></summary>
 
 Each story embeds its title, plus the crawled article text when there is some.
-`hn-indexer embedder` touches only the `embedders` setting (never the rest of
-the index settings), so it is safe on an existing production index where
-`settings` would trigger a full reindex.
+The embedder lives on `hn-stories` only: comments are never embedded, because
+`hn-comments` has no embedder at all. `hn-indexer embedder` touches only the
+`embedders` setting (never the rest of the index settings), so it is safe on
+an existing production index where `settings` would trigger a full reindex.
 
-Keeping comments out is subtle, and was measured on Meilisearch v1.49 rather
-than assumed:
+Poll options sit in `hn-stories` but have no title, and keeping them out is
+subtle. This was measured on Meilisearch v1.49 rather than assumed:
 
 - A plain `documentTemplate` cannot do it. A template that renders to an empty
-  string still gets embedded — as `""` — so every comment would share one
-  identical vector.
+  string still gets embedded — as `""` — so every untitled document would
+  share one identical vector.
 - The embedder therefore uses a `rest` source with an **indexing fragment**
   (the `multimodal` experimental feature, which the command enables). A
   fragment is skipped for a document only when it *outputs* a field the
-  document lacks, and comments have no `title`. See `ARTICLE_FRAGMENT` in
-  `indexer/src/meili.rs` — and note that adding a `doc.type` check there would
-  *break* the exclusion, not tighten it. A unit test guards this.
+  document lacks. See `ARTICLE_FRAGMENT` in `indexer/src/meili.rs` — and note
+  that adding a `doc.type` check there would *break* the exclusion, not
+  tighten it. A unit test guards this.
 - Fragments are `rest`-only, so the local HuggingFace embedder is not offered:
-  it could only embed everything, comments included.
+  it could only embed everything, untitled documents included.
 
 The command makes one embedding call itself before configuring anything. That
 measures the vector size (fragments require an explicit `dimensions`) and

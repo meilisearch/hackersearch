@@ -84,8 +84,8 @@ export function SearchApp() {
     setThreadSeed(undefined);
   }, []);
 
-  // Tags and domains only exist on the News side; points-sort is meaningless
-  // for comments. Drop whatever can't apply when switching tabs.
+  // Tags, domains and points only exist on the News side. Drop whatever
+  // can't apply when switching tabs.
   const setScope = useCallback(
     (scope: Scope) => {
       setState((prev) => ({
@@ -94,6 +94,7 @@ export function SearchApp() {
         page: 1,
         tags: [],
         domains: [],
+        minPoints: scope === "comments" ? 0 : prev.minPoints,
         sort:
           scope === "comments" && prev.sort === "points"
             ? "relevance"

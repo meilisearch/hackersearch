@@ -1,6 +1,6 @@
 ---
 title: Indexing
-description: How the Rust indexer turns the HN Firebase API into a Meilisearch index.
+description: How the Rust indexer turns the HN Firebase API into Meilisearch indexes.
 ---
 
 ## Data source
@@ -12,11 +12,12 @@ item ever created under sequential ids (`/v0/item/{id}.json`), the current
 ## Commands
 
 ```sh
-hn-indexer settings                # create the index + apply settings
+hn-indexer settings                # create both indexes + apply settings
 hn-indexer backfill [--recent N]   # maxitem → 1, or only the last N ids
 hn-indexer backfill --since-days N # everything posted in the last N days
 hn-indexer sync [--interval 30]    # follow new + updated items forever
 hn-indexer run [--recent N]        # settings + backfill + sync in one process
+hn-indexer split                   # one-time: migrate the pre-split `hn` index
 ```
 
 `--since-days` binary-searches the sequential id space for the item closest to
@@ -71,10 +72,39 @@ Enable an embedder afterwards with `settings --embedder huggingface` (local,
 keyless) or `--embedder openai` (needs `OPENAI_API_KEY`). Document upserts use
 HTTP `PUT` (add-or-update), so re-syncing an item never erases its enrichment.
 
-## Index settings
+## Indexes and settings
 
-- **searchableAttributes**: `title`, `text`, `url`, `domain`, `author`
-- **filterableAttributes**: `type`, `tags`, `author`, `domain`, `points`, `num_comments`, `created_at`, `parent`
+Every item is routed by its `type`: comments go to `hn-comments`, everything
+else (stories, jobs, polls, poll options) to `hn-stories`. The UI's two tabs
+map one-to-one onto them.
+
+**`hn-stories`**
+
+- **searchableAttributes**: `title`, `text`
+- **filterableAttributes**: `type`, `tags`, `url`, `author`, `domain`, `points`, `num_comments`, `created_at`, `enrich_gen`
 - **sortableAttributes**: `created_at`, `points`, `num_comments`
 - **rankingRules**: the defaults plus a final `points:desc` tiebreaker, so an
   empty query degrades gracefully into a "top of HN" view
+
+**`hn-comments`** — only what the Comments tab and thread view query
+
+- **searchableAttributes**: `text`
+- **filterableAttributes**: `author`, `parent`, `created_at`
+- **sortableAttributes**: `created_at`
+- **embedders**: none — comments are never embedded
+
+## Migrating from the single `hn` index
+
+Before the split everything lived in one `hn` index. While it exists, every
+command except `split` refuses to run. Stop the old indexer, then:
+
+```sh
+hn-indexer split
+```
+
+It configures `hn-stories`, copies every non-comment document into it (whole,
+so enrichment is kept), verifies the count, deletes those documents from
+`hn`, renames `hn` to `hn-comments` in place, and submits the comment
+settings as a background task. It is checkpointed and safe to re-run.
+Vectors are not copied: re-run `hn-indexer embedder` afterwards if `hn` had
+one.
