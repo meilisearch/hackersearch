@@ -1,6 +1,7 @@
 mod enrich;
 mod hn;
 mod meili;
+mod split;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create the index and apply search settings
+    /// Create both indexes and apply their search settings
     Settings {
         /// Also configure an embedder for semantic search: openai | voyage
         #[arg(long)]
@@ -134,6 +135,10 @@ enum Command {
         #[arg(long, env = "SYNC_INTERVAL", default_value_t = 30)]
         interval: u64,
     },
+    /// One-time migration of the pre-split `hn` index: copy its stories into
+    /// `hn-stories`, delete them from `hn`, and rename it to `hn-comments`.
+    /// Resumable. Stop any running indexer first.
+    Split,
     /// Apply settings, then run backfill and live sync concurrently.
     /// Intended as the long-running service entrypoint.
     Run {
@@ -169,6 +174,8 @@ struct State {
     backfill_floor: Option<u64>,
     /// Highest id already covered by the sync loop.
     sync_last_max: Option<u64>,
+    /// `split`: documents already copied into the stories index.
+    split_copied: Option<u64>,
 }
 
 struct Ctx {
@@ -210,8 +217,17 @@ impl Ctx {
             .filter_map(|doc| async move { doc })
             .collect()
             .await;
-        self.meili.add_documents(&docs).await?;
-        Ok(docs.len())
+        let total = docs.len();
+        let (comments, stories): (Vec<_>, Vec<_>) = docs
+            .into_iter()
+            .partition(|doc| meili::index_for(&doc.kind) == meili::COMMENTS_INDEX);
+        self.meili
+            .add_documents(meili::STORIES_INDEX, &stories)
+            .await?;
+        self.meili
+            .add_documents(meili::COMMENTS_INDEX, &comments)
+            .await?;
+        Ok(total)
     }
 }
 
@@ -576,7 +592,11 @@ async fn enrich_loop(
         // wait can dominate the batch — it sits behind every queued task —
         // which is why it is timed separately from the crawl.
         let write_started = Instant::now();
-        if let Some(task) = ctx.meili.add_documents(&updates).await? {
+        if let Some(task) = ctx
+            .meili
+            .add_documents(meili::STORIES_INDEX, &updates)
+            .await?
+        {
             ctx.meili.wait_for_task(task).await?;
         }
         let write_secs = write_started.elapsed().as_secs_f64();
@@ -729,16 +749,23 @@ async fn main() -> Result<()> {
                     "embedder '{kind}' configured — Meilisearch is now (re)embedding all documents"
                 );
             }
-            info!("index '{}' configured", meili::INDEX_UID);
+            info!(
+                "indexes '{}' and '{}' configured",
+                meili::STORIES_INDEX,
+                meili::COMMENTS_INDEX
+            );
         }
         Command::Embedder { kind } => {
+            ctx.meili.ensure_indexes().await?;
             let task = ctx.meili.apply_embedder(&kind).await?;
             info!(
                 "embedder '{kind}' submitted as task {} — Meilisearch is now embedding \
-                 stories (never comments); follow it with GET /tasks/<uid>",
-                task.map_or("?".to_string(), |t| t.to_string())
+                 '{}'; follow it with GET /tasks/<uid>",
+                task.map_or("?".to_string(), |t| t.to_string()),
+                meili::STORIES_INDEX
             );
         }
+        Command::Split => split::run(&ctx).await?,
         Command::Enrich {
             max_chars,
             limit,
@@ -763,7 +790,7 @@ async fn main() -> Result<()> {
             if let Some(floor) = since {
                 info!("enrich: limited to stories created at or after {floor} (unix)");
             }
-            ctx.meili.ensure_index().await?;
+            ctx.meili.ensure_indexes().await?;
             enrich_loop(
                 &ctx,
                 max_chars,
@@ -781,7 +808,7 @@ async fn main() -> Result<()> {
             recent,
             since_days,
         } => {
-            ctx.meili.ensure_index().await?;
+            ctx.meili.ensure_indexes().await?;
             let (from, to) = if let Some(days) = since_days {
                 let max = hn::max_item(&ctx.hn).await?;
                 let now = std::time::SystemTime::now()
@@ -806,12 +833,13 @@ async fn main() -> Result<()> {
             };
             backfill(&ctx, from, to).await?;
             info!(
-                "index now holds {} documents",
-                ctx.meili.document_count().await?
+                "indexes now hold {} stories and {} comments",
+                ctx.meili.document_count(meili::STORIES_INDEX).await?,
+                ctx.meili.document_count(meili::COMMENTS_INDEX).await?
             );
         }
         Command::Sync { interval } => {
-            ctx.meili.ensure_index().await?;
+            ctx.meili.ensure_indexes().await?;
             sync(&ctx, interval).await?;
         }
         Command::Run {
@@ -822,7 +850,7 @@ async fn main() -> Result<()> {
             enrich_max_chars,
             enrich_cf_concurrency,
         } => {
-            ctx.meili.ensure_index().await?;
+            ctx.meili.ensure_indexes().await?;
             let max = hn::max_item(&ctx.hn).await?;
             let to = recent.map(|n| max.saturating_sub(n).max(1)).unwrap_or(1);
 

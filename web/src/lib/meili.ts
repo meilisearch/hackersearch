@@ -2,6 +2,7 @@ import { Meilisearch } from "meilisearch";
 
 import {
   DATE_RANGES,
+  type Scope,
   type SearchRequest,
   type SearchState,
 } from "./search-state";
@@ -9,7 +10,13 @@ import {
 export const MEILI_HOST =
   process.env.NEXT_PUBLIC_MEILISEARCH_HOST ?? "http://localhost:7700";
 export const MEILI_KEY = process.env.NEXT_PUBLIC_MEILISEARCH_API_KEY ?? "";
-export const INDEX_UID = "hn";
+// Stories/jobs/polls and comments live in separate indexes (see the
+// indexer's meili.rs): each tab searches only its own, much smaller corpus.
+export const STORIES_INDEX = "hn-stories";
+export const COMMENTS_INDEX = "hn-comments";
+
+export const indexFor = (scope: Scope) =>
+  scope === "comments" ? COMMENTS_INDEX : STORIES_INDEX;
 // Name of the configured Meilisearch embedder; empty = semantic search off.
 export const EMBEDDER = process.env.NEXT_PUBLIC_MEILISEARCH_EMBEDDER ?? "";
 
@@ -78,11 +85,8 @@ function buildFilter(
   s: SearchState,
   exclude?: FilterDimension,
 ): (string | string[])[] {
+  // No type filter: the News/Comments tabs query different indexes.
   const filter: (string | string[])[] = [];
-  // The News/Comments tabs partition the corpus before any facet applies.
-  filter.push(
-    s.scope === "comments" ? 'type = "comment"' : 'type != "comment"',
-  );
   if (exclude !== "tags" && s.tags.length) {
     filter.push(s.tags.map((t) => `tags = ${quote(t)}`));
   }
@@ -97,7 +101,8 @@ function buildFilter(
     const cutoff = Math.floor(Date.now() / 1000) - range.seconds;
     filter.push(`created_at >= ${cutoff}`);
   }
-  if (s.minPoints > 0) {
+  // HN has no comment scores, so points aren't filterable on comments.
+  if (s.minPoints > 0 && s.scope !== "comments") {
     filter.push(`points >= ${s.minPoints}`);
   }
   return filter;
@@ -164,9 +169,10 @@ export async function searchHN(
   const lastWord = s.q.split(/\s+/).pop() ?? "";
   const wantCompletion = s.q.length <= 40 && lastWord.length >= 2;
 
+  const indexUid = indexFor(s.scope);
   const buildQueries = () => [
     {
-      indexUid: INDEX_UID,
+      indexUid,
       q: s.q,
       ...hybrid,
       ...perfParam(),
@@ -183,7 +189,7 @@ export async function searchHN(
       cropLength: 45,
     },
     ...activeDims.map((dim) => ({
-      indexUid: INDEX_UID,
+      indexUid,
       q: s.q,
       ...perfParam(),
       filter: buildFilter(s, dim),
@@ -193,15 +199,13 @@ export async function searchHN(
     ...(wantCompletion
       ? [
           {
-            indexUid: INDEX_UID,
+            indexUid: STORIES_INDEX,
             q: s.q,
             ...perfParam(),
-            // Complete only from story titles: match the title field alone,
-            // restrict to posts (comments/poll options have no title), and
-            // take just the single highest-pointed match — the ghost only
-            // ever uses the top one.
+            // Complete only from story titles, on either tab: match the
+            // title field alone and take just the single highest-pointed
+            // match — the ghost only ever uses the top one.
             attributesToSearchOn: ["title"],
-            filter: 'type != "comment"',
             sort: ["points:desc"],
             limit: 1,
             attributesToRetrieve: ["title"],
@@ -276,7 +280,7 @@ export async function searchFacetValues(
   s: SearchState,
   signal?: AbortSignal,
 ): Promise<FacetValueHit[]> {
-  const res = await meili.index(INDEX_UID).searchForFacetValues(
+  const res = await meili.index(indexFor(s.scope)).searchForFacetValues(
     {
       facetName: dim,
       facetQuery,

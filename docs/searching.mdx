@@ -5,6 +5,8 @@ description: How the web UI queries Meilisearch.
 
 ## One round-trip per keystroke
 
+Each tab searches its own index — News queries `hn-stories`, Comments
+queries `hn-comments` — so a query only ever touches the corpus it can show.
 The UI issues a single [`/multi-search`](https://www.meilisearch.com/docs/reference/api/multi_search)
 request containing:
 
@@ -12,8 +14,8 @@ request containing:
 2. one **facet-count query per dimension** (`tags`, `domain`, `author`), each
    with that dimension's own filter removed and `limit: 0`.
 
-This yields *disjunctive* facet counts: checking "Stories" doesn't zero out the
-"Comments" count, so facets behave the way users expect from HN Search.
+This yields *disjunctive* facet counts: checking "Show HN" doesn't zero out the
+"Ask HN" count, so facets behave the way users expect from HN Search.
 
 ## Filters
 

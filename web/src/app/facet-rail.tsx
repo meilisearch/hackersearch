@@ -181,24 +181,27 @@ export function FacetRail({
         </ul>
       </Section>
 
-      <Section title="Points">
-        <div className="flex flex-wrap gap-1.5">
-          {POINTS_OPTIONS.map((points) => (
-            <button
-              key={points}
-              onClick={() => onChange({ minPoints: points })}
-              className={cn(
-                "border px-2 py-0.5 font-mono text-xs transition-colors",
-                state.minPoints === points
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "bg-card text-muted-foreground hover:border-primary hover:text-primary",
-              )}
-            >
-              {points === 0 ? "any" : `${points}+`}
-            </button>
-          ))}
-        </div>
-      </Section>
+      {/* HN exposes no comment scores, so there is nothing to filter on. */}
+      {!isComments && (
+        <Section title="Points">
+          <div className="flex flex-wrap gap-1.5">
+            {POINTS_OPTIONS.map((points) => (
+              <button
+                key={points}
+                onClick={() => onChange({ minPoints: points })}
+                className={cn(
+                  "border px-2 py-0.5 font-mono text-xs transition-colors",
+                  state.minPoints === points
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "bg-card text-muted-foreground hover:border-primary hover:text-primary",
+                )}
+              >
+                {points === 0 ? "any" : `${points}+`}
+              </button>
+            ))}
+          </div>
+        </Section>
+      )}
 
       {!isComments && (
         <ValueFacet
