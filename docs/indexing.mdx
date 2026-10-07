@@ -36,7 +36,7 @@ the full corpus at roughly 17 hours.
   "type": "story",
   "tags": ["story", "show_hn"],
   "title": "Show HN: ...",
-  "text": "Plain text, HTML stripped at index time",
+  "text": "Plain text: paragraphs as blank lines, links as their full href",
   "url": "https://example.com/post",
   "domain": "example.com",
   "author": "pg",
@@ -83,15 +83,30 @@ map one-to-one onto them.
 - **searchableAttributes**: `title`, `text`
 - **filterableAttributes**: `type`, `tags`, `url`, `author`, `domain`, `points`, `num_comments`, `created_at`, `enrich_gen`
 - **sortableAttributes**: `created_at`, `points`, `num_comments`
-- **rankingRules**: the defaults plus a final `points:desc` tiebreaker, so an
-  empty query degrades gracefully into a "top of HN" view
+- **rankingRules**: `words`, `typo`, `proximity`, `sort`, `attributeRank`,
+  `points:desc`, `wordPosition`, `exactness`. Points sit before word position
+  and exactness, so among equally good matches the story HN upvoted wins over
+  its low-point reposts, and an empty query is a "top of HN" view
+- **dictionary**: `C++`, `C#`, `F#` stay whole terms instead of searching as "c"
 
 **`hn-comments`** — only what the Comments tab and thread view query
 
 - **searchableAttributes**: `text`
 - **filterableAttributes**: `author`, `parent`, `created_at`
 - **sortableAttributes**: `created_at`
+- **rankingRules**: the stories rules minus `points:desc` — HN has no comment scores
 - **embedders**: none — comments are never embedded
+
+## Changing settings on a live index
+
+`hn-indexer settings` pushes the whole definition, which reindexes a populated
+index. Two narrow commands exist for production:
+
+```sh
+hn-indexer ranking                # ranking rules only — applied at search time, no reindex
+hn-indexer dictionary stories     # tokenizer dictionary — reindexes hn-stories
+hn-indexer dictionary comments    # …and hn-comments (~40M documents: hours)
+```
 
 ## Migrating from the single `hn` index
 

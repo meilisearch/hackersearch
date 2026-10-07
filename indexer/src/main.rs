@@ -81,6 +81,16 @@ enum Command {
         /// openai | voyage
         kind: String,
     },
+    /// Push ONLY the ranking rules to both indexes. Ranking is applied at
+    /// search time, so nothing is reindexed — safe on production.
+    Ranking,
+    /// Push ONLY the tokenizer dictionary (keeps "C++", "C#", "F#" whole).
+    /// This REINDEXES the target index: minutes for the stories index, hours
+    /// for the comments index.
+    Dictionary {
+        /// stories | comments
+        index: String,
+    },
     /// Fetch the pages stories link to and store extracted article text on
     /// the documents (embedding fodder — not full-text indexed)
     Enrich {
@@ -763,6 +773,27 @@ async fn main() -> Result<()> {
                  '{}'; follow it with GET /tasks/<uid>",
                 task.map_or("?".to_string(), |t| t.to_string()),
                 meili::STORIES_INDEX
+            );
+        }
+        Command::Ranking => {
+            ctx.meili.apply_ranking_rules().await?;
+            info!(
+                "ranking rules live on '{}' and '{}'",
+                meili::STORIES_INDEX,
+                meili::COMMENTS_INDEX
+            );
+        }
+        Command::Dictionary { index } => {
+            let uid = match index.as_str() {
+                "stories" => meili::STORIES_INDEX,
+                "comments" => meili::COMMENTS_INDEX,
+                other => anyhow::bail!("unknown index '{other}' (stories|comments)"),
+            };
+            let task = ctx.meili.apply_dictionary(uid).await?;
+            info!(
+                "dictionary submitted as task {} — Meilisearch is now reindexing '{uid}'; \
+                 follow it with GET /tasks/<uid>",
+                task.map_or("?".to_string(), |t| t.to_string()),
             );
         }
         Command::Split => split::run(&ctx).await?,
