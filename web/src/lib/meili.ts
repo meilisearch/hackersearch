@@ -21,6 +21,12 @@ export const indexFor = (scope: Scope) =>
 export const EMBEDDER = process.env.NEXT_PUBLIC_MEILISEARCH_EMBEDDER ?? "";
 
 export const HITS_PER_PAGE = 20;
+/** Mirrors both indexes' `pagination.maxTotalHits` (indexer meili.rs):
+ *  Meilisearch never returns hits past this rank, however many match. */
+export const MAX_TOTAL_HITS = 10_000;
+/** The last page that can hold any hits. Meilisearch's `totalPages` counts
+ *  every match, so "rust" claimed 1,700 pages and pages 501+ came back empty. */
+export const MAX_PAGES = Math.ceil(MAX_TOTAL_HITS / HITS_PER_PAGE);
 
 // Private-use-area markers survive JSON round-trips and can never appear in
 // real HN content, so highlighted fields can be rendered without innerHTML.
@@ -69,6 +75,9 @@ export interface HNSearchResult {
   processingTimeMs: number;
   /** Full client-observed round-trip for the multi-search request. */
   roundTripMs: number;
+  /** Set when the result came from the shared front-page cache rather than
+   *  a live search, so the engine time shown would be someone else's. */
+  cached?: boolean;
   facets: {
     tags: FacetCounts;
     domain: FacetCounts;
@@ -249,7 +258,10 @@ export async function searchHN(
     completionHits,
     totalHits:
       "totalHits" in main ? (main.totalHits as number) : main.hits.length,
-    totalPages: "totalPages" in main ? (main.totalPages as number) : 1,
+    totalPages: Math.min(
+      "totalPages" in main ? (main.totalPages as number) : 1,
+      MAX_PAGES,
+    ),
     page: s.page,
     processingTimeMs: main.processingTimeMs,
     roundTripMs: Math.round(performance.now() - startedAt),

@@ -7,14 +7,14 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { searchHN } from "@/lib/meili";
+import { searchOrFrontPage } from "@/lib/front-page";
 import type { SearchRequest } from "@/lib/search-state";
 
 export function useHNSearch(state: SearchRequest) {
   const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: ["hn-search", state],
-    queryFn: ({ signal }) => searchHN(state, signal),
+    queryFn: ({ signal }) => searchOrFrontPage(state, signal),
     placeholderData: keepPreviousData,
   });
 

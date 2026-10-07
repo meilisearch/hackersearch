@@ -18,6 +18,7 @@ import { useThread } from "@/hooks/use-thread";
 
 import { CommentNode } from "./comment-node";
 import { Notice } from "./notice";
+import { RichText } from "./rich-text";
 
 interface ThreadViewProps {
   rootId: number;
@@ -317,9 +318,10 @@ function RootHeader({ root }: { root: HNHit }) {
         )}
       </h2>
       {root.text && (
-        <p className="mt-2 text-sm leading-relaxed text-foreground/85 [overflow-wrap:anywhere]">
-          {root.text}
-        </p>
+        <RichText
+          text={root.text}
+          className="mt-2 text-sm leading-relaxed text-foreground/85"
+        />
       )}
       <div className="mt-1.5 flex flex-wrap items-center gap-x-3 font-mono text-xs text-muted-foreground">
         {root.type !== "comment" && (
