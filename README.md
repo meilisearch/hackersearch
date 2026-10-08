@@ -89,11 +89,20 @@ hn-indexer enrich                      # crawl story URLs, store extracted artic
 hn-indexer enrich --since 2025-01-01   # …only stories posted on or after a date
 hn-indexer enrich --watch              # …and keep going, picking up new stories
 hn-indexer embedder openai|voyage      # enable semantic search (stories only, never comments)
+hn-indexer ranking                     # push ONLY the ranking rules (no reindex)
+hn-indexer dictionary stories|comments # push ONLY the tokenizer dictionary (reindexes that index)
 hn-indexer split                       # one-time: migrate the old single `hn` index
 ```
 
-Deleted and dead items are skipped. Comment HTML is stripped at index time, so
-documents are plain text and the UI never renders HTML from HN.
+Deleted and dead items are skipped. Comment HTML is converted to plain text at
+index time, so the UI never renders HTML from HN. Paragraphs survive as blank
+lines, `<pre>` blocks verbatim, and links as their full `href` (HN's link text
+is the URL truncated with `...`).
+
+`settings` pushes the whole definition, which reindexes everything on a
+populated index. On production, use the narrow commands instead: `ranking` is
+applied at search time and never reindexes; `dictionary` reindexes only the
+index you name.
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -144,11 +153,19 @@ Documents (`id` primary key): `type`, `tags` (`story`, `ask_hn`, `show_hn`,
 - **Searchable**: title, text
 - **Facets/filters**: tags, type, url, author, domain, points, num_comments,
   created_at, enrich_gen
-- **Sorts**: relevance (with a `points:desc` tiebreaker), newest, points
+- **Sorts**: relevance, newest, points
+- **Ranking**: `words`, `typo`, `proximity`, `sort`, `attributeRank`,
+  `points:desc`, `wordPosition`, `exactness`. Points rank *before* word
+  position and exactness: HN reposts the same link many times, and most
+  reposts sink at 1–5 points, so with popularity last a 2-point repost titled
+  exactly like the query outranked the 1,767-point original.
+- **Dictionary**: `C++`, `C#`, `F#` are kept whole; otherwise `+` and `#` are
+  separators and "C++" searches for "c".
 
 **`hn-comments`**
 
 - **Searchable**: text
+- **Ranking**: as above, minus `points:desc` (HN exposes no comment scores)
 - **Facets/filters**: author, parent (the thread walk), created_at. HN
   exposes no comment scores, so there is no points filter on this tab.
 - **Sorts**: relevance, newest

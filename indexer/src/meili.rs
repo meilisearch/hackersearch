@@ -68,6 +68,52 @@ pub struct Enrichable {
     pub title: Option<String>,
 }
 
+/// Ranking of [`STORIES_INDEX`].
+///
+/// - `sort` sits before the attribute rules: when a query asks for an
+///   explicit sort (the UI's Newest/Points modes, the ghost completion's
+///   points:desc) it should dominate over where the terms matched.
+/// - `points:desc` sits right after `attributeRank`, BEFORE `wordPosition`
+///   and `exactness`. HN reposts the same link many times, and most reposts
+///   sink at 1–5 points; with popularity last, a 2-point repost titled
+///   exactly like the query ("Why I Quit Google") outranked the 1,767-point
+///   original, and titles merely *starting* with the query word buried the
+///   classics ("Backdoor in upstream xz/liblzma…", 4,549 points, fell off
+///   page 1 of "xz backdoor"). Among documents that match equally well —
+///   same words, typos, attribute — the one HN upvoted wins.
+///
+/// Changing ranking rules does not reindex; see `hn-indexer ranking`.
+pub const STORIES_RANKING_RULES: [&str; 8] = [
+    "words",
+    "typo",
+    "proximity",
+    "sort",
+    "attributeRank",
+    "points:desc",
+    "wordPosition",
+    "exactness",
+];
+
+/// Ranking of [`COMMENTS_INDEX`]: HN exposes no comment scores, so there is
+/// no popularity signal to put anywhere.
+pub const COMMENTS_RANKING_RULES: [&str; 7] = [
+    "words",
+    "typo",
+    "proximity",
+    "sort",
+    "attributeRank",
+    "wordPosition",
+    "exactness",
+];
+
+/// Terms the tokenizer must keep whole. Without these, `+` and `#` are
+/// separators, so "C++" and "C#" are indexed and searched as plain "c" —
+/// a search for C++ returned "C--" and posts titled just "C".
+///
+/// Changing the dictionary reindexes the whole index; see `hn-indexer
+/// dictionary`.
+pub const DICTIONARY: [&str; 6] = ["C++", "c++", "C#", "c#", "F#", "f#"];
+
 /// Search configuration of [`STORIES_INDEX`].
 fn stories_settings() -> serde_json::Value {
     // url, domain, and author are excluded from full-text search: url is
@@ -97,15 +143,8 @@ fn stories_settings() -> serde_json::Value {
               "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
         ],
         "sortableAttributes": ["created_at", "points", "num_comments"],
-        // sort sits BEFORE attribute (default is after): when a query asks
-        // for an explicit sort — the UI's Newest/Points modes and the
-        // ghost-completion query's points:desc — it should dominate over
-        // which attribute/position the terms matched in. Queries without a
-        // sort param are unaffected.
-        "rankingRules": [
-            "words", "typo", "proximity", "sort", "attribute", "exactness",
-            "points:desc"
-        ],
+        "rankingRules": STORIES_RANKING_RULES,
+        "dictionary": DICTIONARY,
         // Terms only need to share an attribute, not sit at an exact word
         // distance — cheaper to compute and title/text are independent
         // fields anyway, so exact cross-field distance was never meaningful.
@@ -134,7 +173,8 @@ fn comments_settings() -> serde_json::Value {
               "features": { "facetSearch": false, "filter": { "equality": false, "comparison": true } } }
         ],
         "sortableAttributes": ["created_at"],
-        "rankingRules": ["words", "typo", "proximity", "sort", "attribute", "exactness"],
+        "rankingRules": COMMENTS_RANKING_RULES,
+        "dictionary": DICTIONARY,
         "proximityPrecision": "byAttribute",
         "faceting": { "maxValuesPerFacet": 100 },
         "pagination": { "maxTotalHits": 10000 },
@@ -256,16 +296,52 @@ impl Meili {
         } else {
             stories_settings()
         };
+        self.patch_settings(uid, &settings).await
+    }
+
+    /// PATCH a subset of `uid`'s settings, leaving every other setting
+    /// untouched. Returns the settings task uid without waiting on it.
+    pub async fn patch_settings(
+        &self,
+        uid: &str,
+        settings: &serde_json::Value,
+    ) -> Result<Option<u64>> {
         let task: serde_json::Value = self
             .request(reqwest::Method::PATCH, &format!("/indexes/{uid}/settings"))
-            .json(&settings)
+            .json(settings)
             .send()
             .await?
             .error_for_status()
-            .with_context(|| format!("applying settings to '{uid}'"))?
+            .with_context(|| format!("patching settings of '{uid}'"))?
             .json()
             .await?;
         Ok(task["taskUid"].as_u64())
+    }
+
+    /// Push ONLY the ranking rules to both indexes and wait until they are
+    /// live. Ranking is applied at search time, so this does not reindex:
+    /// safe on the production indexes, unlike `apply_settings()`.
+    pub async fn apply_ranking_rules(&self) -> Result<()> {
+        self.refuse_legacy().await?;
+        for (uid, rules) in [
+            (STORIES_INDEX, &STORIES_RANKING_RULES[..]),
+            (COMMENTS_INDEX, &COMMENTS_RANKING_RULES[..]),
+        ] {
+            if let Some(task) = self
+                .patch_settings(uid, &json!({ "rankingRules": rules }))
+                .await?
+            {
+                self.wait_for_task(task).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push ONLY the tokenizer dictionary to `uid`. This DOES reindex that
+    /// whole index, so the task is returned rather than waited on.
+    pub async fn apply_dictionary(&self, uid: &str) -> Result<Option<u64>> {
+        self.refuse_legacy().await?;
+        self.patch_settings(uid, &json!({ "dictionary": DICTIONARY })).await
     }
 
     /// Upsert documents. Uses PUT (add-or-UPDATE) rather than POST
@@ -651,5 +727,17 @@ mod tests {
             assert!(comments.contains(&attr.to_string()), "comments: {attr}");
         }
         assert!(comments_settings()["embedders"].is_null());
+    }
+
+    /// Popularity must outrank word position and exactness, or low-point
+    /// reposts titled exactly like the query bury the original story.
+    #[test]
+    fn points_rank_before_word_position_and_exactness() {
+        let pos = |rule: &str| STORIES_RANKING_RULES.iter().position(|r| *r == rule).unwrap();
+        assert!(pos("points:desc") < pos("wordPosition"));
+        assert!(pos("points:desc") < pos("exactness"));
+        assert!(pos("attributeRank") < pos("points:desc"));
+        assert!(!STORIES_RANKING_RULES.contains(&"attribute"));
+        assert!(!COMMENTS_RANKING_RULES.contains(&"attribute"));
     }
 }

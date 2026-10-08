@@ -150,23 +150,51 @@ fn extract_domain(raw_url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
 }
 
-/// Strip HTML tags and decode the handful of entities HN actually emits.
-/// Good enough for search indexing — not a general-purpose HTML parser.
+/// Turn HN's comment/self-post HTML into plain text, keeping what readers
+/// need: paragraph breaks (`<p>` becomes a blank line), `<pre>` blocks
+/// verbatim, and the FULL target of each link. HN renders long URLs as
+/// truncated link text ("https://gist.github.com/smx-smx/a611...") with the
+/// real URL only in `href`, so the text is dropped in favour of the href.
+/// Good enough for search indexing and display — not a general HTML parser.
 fn strip_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut in_tag = false;
+    let mut pre = false;
+    // While inside <a href>, its text is skipped and the href emitted at </a>.
+    let mut link: Option<String> = None;
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '<' => {
-                in_tag = true;
-                // Block-ish tags become whitespace so words don't glue together.
-                if !out.ends_with(' ') && !out.is_empty() {
-                    out.push(' ');
+                let mut tag = String::new();
+                for next in chars.by_ref() {
+                    if next == '>' {
+                        break;
+                    }
+                    tag.push(next);
+                }
+                let closing = tag.starts_with('/');
+                let name = tag
+                    .trim_start_matches('/')
+                    .split(|ch: char| ch.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                match name.as_str() {
+                    "p" | "br" => paragraph_break(&mut out),
+                    "pre" => {
+                        paragraph_break(&mut out);
+                        pre = !closing;
+                    }
+                    "a" if !closing => link = href(&tag),
+                    "a" => {
+                        if let Some(url) = link.take() {
+                            push_text(&mut out, &url, pre);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            '>' if in_tag => in_tag = false,
-            _ if in_tag => {}
+            _ if link.is_some() => {}
             '&' => {
                 let mut entity = String::new();
                 while let Some(&next) = chars.peek() {
@@ -179,12 +207,71 @@ fn strip_html(input: &str) -> String {
                 if chars.peek() == Some(&';') {
                     chars.next();
                 }
-                out.push_str(decode_entity(&entity));
+                push_text(&mut out, decode_entity(&entity), pre);
             }
-            _ => out.push(c),
+            _ => push_char(&mut out, c, pre),
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out.trim().to_string()
+}
+
+/// Append text, collapsing whitespace runs outside `<pre>`.
+fn push_text(out: &mut String, text: &str, pre: bool) {
+    for c in text.chars() {
+        push_char(out, c, pre);
+    }
+}
+
+fn push_char(out: &mut String, c: char, pre: bool) {
+    if pre {
+        out.push(c);
+    } else if c.is_whitespace() {
+        if !out.is_empty() && !out.ends_with(char::is_whitespace) {
+            out.push(' ');
+        }
+    } else {
+        out.push(c);
+    }
+}
+
+/// End the current paragraph: exactly one blank line, never leading.
+fn paragraph_break(out: &mut String) {
+    let trimmed = out.trim_end_matches([' ', '\t']).len();
+    out.truncate(trimmed);
+    if out.is_empty() {
+        return;
+    }
+    while !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+}
+
+/// The decoded `href` of an `<a ...>` tag body, if it has one.
+fn href(tag: &str) -> Option<String> {
+    let start = tag.find("href=\"")? + "href=\"".len();
+    let len = tag[start..].find('"')?;
+    let mut url = String::new();
+    // Entities inside attributes use the same handful HN emits in text.
+    let mut chars = tag[start..start + len].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            url.push(c);
+            continue;
+        }
+        let mut entity = String::new();
+        while let Some(&next) = chars.peek() {
+            if next == ';' || entity.len() > 8 {
+                break;
+            }
+            entity.push(next);
+            chars.next();
+        }
+        if chars.peek() == Some(&';') {
+            chars.next();
+        }
+        url.push_str(decode_entity(&entity));
+    }
+    Some(url).filter(|u| !u.is_empty())
 }
 
 fn decode_entity(entity: &str) -> &'static str {
@@ -209,8 +296,32 @@ mod tests {
 
     #[test]
     fn strips_tags_and_entities() {
-        let html = "Hello <p>world &amp; friends</p> <a href=\"x\">link</a> &#x27;quoted&#x27;";
-        assert_eq!(strip_html(html), "Hello world & friends link 'quoted'");
+        let html = "Hello <i>world</i> &amp; friends &#x27;quoted&#x27;";
+        assert_eq!(strip_html(html), "Hello world & friends 'quoted'");
+    }
+
+    #[test]
+    fn keeps_paragraph_breaks() {
+        let html = "First   paragraph.<p>Second\nparagraph.<p><p>Third.";
+        assert_eq!(strip_html(html), "First paragraph.\n\nSecond paragraph.\n\nThird.");
+    }
+
+    #[test]
+    fn keeps_preformatted_blocks_verbatim() {
+        let html = "Try:<p><pre><code>  fn main() {\n      run();\n  }\n</code></pre>Done.";
+        assert_eq!(
+            strip_html(html),
+            "Try:\n\n  fn main() {\n      run();\n  }\n\nDone."
+        );
+    }
+
+    #[test]
+    fn replaces_truncated_link_text_with_full_href() {
+        let html = "See <a href=\"https:&#x2F;&#x2F;gist.github.com&#x2F;q3k&#x2F;af3d93b6a1f399de28fe194add452d01\" rel=\"nofollow\">https:&#x2F;&#x2F;gist.github.com&#x2F;q3k&#x2F;af3d93b6a1f399de28fe1...</a> for details";
+        assert_eq!(
+            strip_html(html),
+            "See https://gist.github.com/q3k/af3d93b6a1f399de28fe194add452d01 for details"
+        );
     }
 
     #[test]
