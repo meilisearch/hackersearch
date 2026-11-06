@@ -6,6 +6,7 @@ import { memo } from "react";
 
 import { hnItemUrl, type HNHit } from "@/lib/meili";
 import type { SearchState, ThreadState } from "@/lib/search-state";
+import type { StoryRef } from "@/lib/story-context";
 import { cn } from "@/lib/utils";
 
 import { Highlighted } from "./highlighted";
@@ -23,6 +24,8 @@ const TAG_LABELS: Record<string, string> = {
 
 interface HitCardProps {
   hit: HNHit;
+  /** For a comment: the story it belongs to, once resolved. */
+  story?: StoryRef;
   onState: (patch: Partial<SearchState>) => void;
   // Only the two arrays this card reads, not the whole SearchState — their
   // references stay stable while typing (q changes don't touch them), so the
@@ -34,6 +37,7 @@ interface HitCardProps {
 
 export const HitCard = memo(function HitCard({
   hit,
+  story,
   onState,
   domains,
   authors,
@@ -94,6 +98,16 @@ export const HitCard = memo(function HitCard({
         </h2>
       )}
 
+      {story && (
+        <button
+          onClick={() => onOpenThread({ rootId: story.id, focusId: hit.id })}
+          className="block max-w-full truncate text-left font-mono text-xs text-muted-foreground hover:text-primary"
+          title={`Open this comment in “${story.title}”`}
+        >
+          on: <span className="text-foreground/70">{story.title}</span>
+        </button>
+      )}
+
       {hit.text && (
         <p
           className={cn(
@@ -147,7 +161,9 @@ export const HitCard = memo(function HitCard({
           className="inline-flex items-center gap-1 hover:text-primary hover:underline"
         >
           <MessageSquare className="size-3" />
-          {isComment ? "thread" : `${hit.num_comments} comments`}
+          {isComment
+            ? "thread"
+            : `${hit.num_comments} ${hit.num_comments === 1 ? "comment" : "comments"}`}
         </button>
         <a
           href={hnItemUrl(hit.id)}

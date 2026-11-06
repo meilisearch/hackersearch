@@ -1,6 +1,6 @@
 import { MeilisearchApiError } from "meilisearch";
 
-import { INDEX_UID, meili, type HNHit } from "./meili";
+import { COMMENTS_INDEX, STORIES_INDEX, meili, type HNHit } from "./meili";
 
 /** Hard stops for the downward walk. */
 export const MAX_DEPTH = 25;
@@ -79,7 +79,7 @@ export type LevelSearch = (
 
 /** The real Meilisearch query behind one level chunk. */
 const meiliLevelSearch: LevelSearch = async (parentIds, page, signal) => {
-  const res = await meili.index(INDEX_UID).search(
+  const res = await meili.index(COMMENTS_INDEX).search(
     "",
     {
       filter: `parent IN [${parentIds.join(",")}]`,
@@ -191,13 +191,13 @@ export function isDocumentNotFound(error: unknown): boolean {
 }
 
 /**
- * Read one document by id. meilisearch 0.59's `getDocument` takes no
- * `extraRequestInit`, so this cannot be given an AbortSignal — callers rely on
- * TanStack discarding results for keys it no longer observes.
+ * Read one document by id from one index. meilisearch 0.59's `getDocument`
+ * takes no `extraRequestInit`, so this cannot be given an AbortSignal —
+ * callers rely on TanStack discarding results for keys it no longer observes.
  */
-export const meiliDocumentFetch: DocumentFetch = async (id) => {
+async function getFrom(index: string, id: number): Promise<HNHit | null> {
   try {
-    return await meili.index(INDEX_UID).getDocument<HNHit>(id);
+    return await meili.index(index).getDocument<HNHit>(id);
   } catch (error) {
     // Only a genuinely absent document means "no such item" — deleted, dead,
     // or never indexed. Anything else (network, 5xx, auth) must propagate, or
@@ -205,6 +205,19 @@ export const meiliDocumentFetch: DocumentFetch = async (id) => {
     if (isDocumentNotFound(error)) return null;
     throw error;
   }
+}
+
+/**
+ * Read one item by id. An id alone doesn't say whether it is a comment or a
+ * story, so both indexes are asked at once — HN ids are unique across types,
+ * so at most one answers, and the lookup costs one round-trip, not two.
+ */
+export const meiliDocumentFetch: DocumentFetch = async (id) => {
+  const [comment, story] = await Promise.all([
+    getFrom(COMMENTS_INDEX, id),
+    getFrom(STORIES_INDEX, id),
+  ]);
+  return comment ?? story;
 };
 
 export interface ThreadRoot {

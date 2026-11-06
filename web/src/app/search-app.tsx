@@ -21,7 +21,8 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
-import { EMBEDDER, searchHN, type HNHit } from "@/lib/meili";
+import { searchOrFrontPage } from "@/lib/front-page";
+import { EMBEDDER, type HNHit } from "@/lib/meili";
 import { useDebounced, useHNSearch } from "@/hooks/use-hn-search";
 import { useOpenFacets } from "@/hooks/use-open-facets";
 import {
@@ -84,8 +85,8 @@ export function SearchApp() {
     setThreadSeed(undefined);
   }, []);
 
-  // Tags and domains only exist on the News side; points-sort is meaningless
-  // for comments. Drop whatever can't apply when switching tabs.
+  // Tags, domains and points only exist on the News side. Drop whatever
+  // can't apply when switching tabs.
   const setScope = useCallback(
     (scope: Scope) => {
       setState((prev) => ({
@@ -94,6 +95,7 @@ export function SearchApp() {
         page: 1,
         tags: [],
         domains: [],
+        minPoints: scope === "comments" ? 0 : prev.minPoints,
         sort:
           scope === "comments" && prev.sort === "points"
             ? "relevance"
@@ -170,7 +172,7 @@ export function SearchApp() {
       const target = { ...queryState, page };
       queryClient.prefetchQuery({
         queryKey: ["hn-search", target],
-        queryFn: ({ signal }) => searchHN(target, signal),
+        queryFn: ({ signal }) => searchOrFrontPage(target, signal),
         staleTime: 30_000,
       });
     },

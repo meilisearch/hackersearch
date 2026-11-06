@@ -1,6 +1,5 @@
 export const TAG_OPTIONS = [
   { value: "story", label: "Stories" },
-  { value: "comment", label: "Comments" },
   { value: "ask_hn", label: "Ask HN" },
   { value: "show_hn", label: "Show HN" },
   { value: "launch_hn", label: "Launch HN" },
@@ -91,8 +90,9 @@ export function paramsToState(p: URLSearchParams): SearchState {
     p.get(key)?.split(",").filter(Boolean) ?? [];
   const date = p.get("date");
   const sort = p.get("sort");
+  const scope: Scope = p.get("tab") === "comments" ? "comments" : "news";
   return {
-    scope: p.get("tab") === "comments" ? "comments" : "news",
+    scope,
     semantic: p.get("sem") === "1",
     q: p.get("q") ?? "",
     tags: list("tags"),
@@ -101,7 +101,9 @@ export function paramsToState(p: URLSearchParams): SearchState {
     dateRange: DATE_RANGES.some((d) => d.value === date)
       ? (date as DateRange)
       : "all",
-    minPoints: Math.max(0, Number(p.get("points")) || 0),
+    // Comments have no points; a hand-edited link must not count as a filter.
+    minPoints:
+      scope === "comments" ? 0 : Math.max(0, Number(p.get("points")) || 0),
     sort: sort === "date" || sort === "points" ? sort : "relevance",
     page: Math.max(1, Number(p.get("page")) || 1),
   };
