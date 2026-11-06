@@ -4,7 +4,13 @@ import type { UseQueryResult } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, ServerCrash } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import { MEILI_HOST, type HNHit, type HNSearchResult } from "@/lib/meili";
+import { useStoryContext } from "@/hooks/use-story-context";
+import {
+  MAX_TOTAL_HITS,
+  MEILI_HOST,
+  type HNHit,
+  type HNSearchResult,
+} from "@/lib/meili";
 import {
   hasActiveFilters,
   type SearchState,
@@ -33,6 +39,7 @@ export function Results({
   onOpenThread,
 }: ResultsProps) {
   const { data, isPending, isError, isFetching } = search;
+  const stories = useStoryContext(data?.hits);
 
   if (isError) {
     return (
@@ -75,10 +82,36 @@ export function Results({
   if (data.totalHits === 0) {
     return (
       <Notice title="No results">
+        {hasActiveFilters(state) ? (
+          <p>
+            Nothing matches{state.q ? <> “{state.q}”</> : null} with the current
+            filters. Try widening the time range or removing facets.
+          </p>
+        ) : (
+          <p>
+            Nothing matches “{state.q}”. Check the spelling, or try fewer or
+            different words.
+          </p>
+        )}
+      </Notice>
+    );
+  }
+
+  // Only reachable through a hand-edited or stale link: the pager never
+  // offers a page past MAX_PAGES.
+  if (data.hits.length === 0) {
+    return (
+      <Notice title={`Results stop at page ${data.totalPages}`}>
         <p>
-          Nothing matches{state.q ? <> “{state.q}”</> : null} with the current
-          filters. Try widening the time range or removing facets.
+          Only the top {MAX_TOTAL_HITS.toLocaleString("en-US")} matches can be
+          browsed. Narrow the search with filters or more specific words.
         </p>
+        <button
+          onClick={() => onPage(data.totalPages)}
+          className="mt-3 font-mono text-xs text-primary hover:underline"
+        >
+          ← go to page {data.totalPages}
+        </button>
       </Notice>
     );
   }
@@ -96,8 +129,8 @@ export function Results({
           title="engine = Meilisearch processing time · wire = full network round-trip"
         >
           {data.totalHits.toLocaleString("en-US")}
-          {data.totalHits === 10_000 ? "+" : ""} results ·{" "}
-          {data.processingTimeMs} ms engine
+          {data.totalHits === MAX_TOTAL_HITS ? "+" : ""} results ·{" "}
+          {data.cached ? "cached" : <>{data.processingTimeMs} ms engine</>}
           <span className="max-sm:hidden"> · {data.roundTripMs} ms wire</span>
         </span>
         <span className="tabular-nums">
@@ -110,6 +143,7 @@ export function Results({
           <HitCard
             key={hit.id}
             hit={hit}
+            story={stories.get(hit.id)}
             domains={state.domains}
             authors={state.authors}
             onState={onState}

@@ -8,6 +8,8 @@ import { hnItemUrl, hnUserUrl } from "@/lib/meili";
 import { countDescendants, type ThreadNode } from "@/lib/thread";
 import { cn } from "@/lib/utils";
 
+import { RichText } from "./rich-text";
+
 interface CommentNodeProps {
   node: ThreadNode;
   /** Ids whose collapse state has been flipped from its depth default —
@@ -85,9 +87,10 @@ export const CommentNode = memo(function CommentNodeInner({
       {!isCollapsed && (
         <>
           {node.text ? (
-            <p className="mt-1 text-sm leading-relaxed text-foreground/85 [overflow-wrap:anywhere]">
-              {node.text}
-            </p>
+            <RichText
+              text={node.text}
+              className="mt-1 text-sm leading-relaxed text-foreground/85"
+            />
           ) : (
             <p className="mt-1 font-mono text-xs text-muted-foreground italic">
               [no content]

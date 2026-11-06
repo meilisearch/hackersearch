@@ -2,6 +2,7 @@ import { Meilisearch } from "meilisearch";
 
 import {
   DATE_RANGES,
+  type Scope,
   type SearchRequest,
   type SearchState,
 } from "./search-state";
@@ -9,11 +10,23 @@ import {
 export const MEILI_HOST =
   process.env.NEXT_PUBLIC_MEILISEARCH_HOST ?? "http://localhost:7700";
 export const MEILI_KEY = process.env.NEXT_PUBLIC_MEILISEARCH_API_KEY ?? "";
-export const INDEX_UID = "hn";
+// Stories/jobs/polls and comments live in separate indexes (see the
+// indexer's meili.rs): each tab searches only its own, much smaller corpus.
+export const STORIES_INDEX = "hn-stories";
+export const COMMENTS_INDEX = "hn-comments";
+
+export const indexFor = (scope: Scope) =>
+  scope === "comments" ? COMMENTS_INDEX : STORIES_INDEX;
 // Name of the configured Meilisearch embedder; empty = semantic search off.
 export const EMBEDDER = process.env.NEXT_PUBLIC_MEILISEARCH_EMBEDDER ?? "";
 
 export const HITS_PER_PAGE = 20;
+/** Mirrors both indexes' `pagination.maxTotalHits` (indexer meili.rs):
+ *  Meilisearch never returns hits past this rank, however many match. */
+export const MAX_TOTAL_HITS = 10_000;
+/** The last page that can hold any hits. Meilisearch's `totalPages` counts
+ *  every match, so "rust" claimed 1,700 pages and pages 501+ came back empty. */
+export const MAX_PAGES = Math.ceil(MAX_TOTAL_HITS / HITS_PER_PAGE);
 
 // Private-use-area markers survive JSON round-trips and can never appear in
 // real HN content, so highlighted fields can be rendered without innerHTML.
@@ -62,6 +75,9 @@ export interface HNSearchResult {
   processingTimeMs: number;
   /** Full client-observed round-trip for the multi-search request. */
   roundTripMs: number;
+  /** Set when the result came from the shared front-page cache rather than
+   *  a live search, so the engine time shown would be someone else's. */
+  cached?: boolean;
   facets: {
     tags: FacetCounts;
     domain: FacetCounts;
@@ -78,11 +94,8 @@ function buildFilter(
   s: SearchState,
   exclude?: FilterDimension,
 ): (string | string[])[] {
+  // No type filter: the News/Comments tabs query different indexes.
   const filter: (string | string[])[] = [];
-  // The News/Comments tabs partition the corpus before any facet applies.
-  filter.push(
-    s.scope === "comments" ? 'type = "comment"' : 'type != "comment"',
-  );
   if (exclude !== "tags" && s.tags.length) {
     filter.push(s.tags.map((t) => `tags = ${quote(t)}`));
   }
@@ -97,7 +110,8 @@ function buildFilter(
     const cutoff = Math.floor(Date.now() / 1000) - range.seconds;
     filter.push(`created_at >= ${cutoff}`);
   }
-  if (s.minPoints > 0) {
+  // HN has no comment scores, so points aren't filterable on comments.
+  if (s.minPoints > 0 && s.scope !== "comments") {
     filter.push(`points >= ${s.minPoints}`);
   }
   return filter;
@@ -164,9 +178,10 @@ export async function searchHN(
   const lastWord = s.q.split(/\s+/).pop() ?? "";
   const wantCompletion = s.q.length <= 40 && lastWord.length >= 2;
 
+  const indexUid = indexFor(s.scope);
   const buildQueries = () => [
     {
-      indexUid: INDEX_UID,
+      indexUid,
       q: s.q,
       ...hybrid,
       ...perfParam(),
@@ -183,7 +198,7 @@ export async function searchHN(
       cropLength: 45,
     },
     ...activeDims.map((dim) => ({
-      indexUid: INDEX_UID,
+      indexUid,
       q: s.q,
       ...perfParam(),
       filter: buildFilter(s, dim),
@@ -193,15 +208,13 @@ export async function searchHN(
     ...(wantCompletion
       ? [
           {
-            indexUid: INDEX_UID,
+            indexUid: STORIES_INDEX,
             q: s.q,
             ...perfParam(),
-            // Complete only from story titles: match the title field alone,
-            // restrict to posts (comments/poll options have no title), and
-            // take just the single highest-pointed match — the ghost only
-            // ever uses the top one.
+            // Complete only from story titles, on either tab: match the
+            // title field alone and take just the single highest-pointed
+            // match — the ghost only ever uses the top one.
             attributesToSearchOn: ["title"],
-            filter: 'type != "comment"',
             sort: ["points:desc"],
             limit: 1,
             attributesToRetrieve: ["title"],
@@ -245,7 +258,10 @@ export async function searchHN(
     completionHits,
     totalHits:
       "totalHits" in main ? (main.totalHits as number) : main.hits.length,
-    totalPages: "totalPages" in main ? (main.totalPages as number) : 1,
+    totalPages: Math.min(
+      "totalPages" in main ? (main.totalPages as number) : 1,
+      MAX_PAGES,
+    ),
     page: s.page,
     processingTimeMs: main.processingTimeMs,
     roundTripMs: Math.round(performance.now() - startedAt),
@@ -276,7 +292,7 @@ export async function searchFacetValues(
   s: SearchState,
   signal?: AbortSignal,
 ): Promise<FacetValueHit[]> {
-  const res = await meili.index(INDEX_UID).searchForFacetValues(
+  const res = await meili.index(indexFor(s.scope)).searchForFacetValues(
     {
       facetName: dim,
       facetQuery,

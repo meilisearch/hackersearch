@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_STATE,
+  hasActiveFilters,
   paramsToState,
   stateToParams,
   threadFromParams,
@@ -55,5 +56,18 @@ describe("threadToParams / threadFromParams", () => {
     expect(paramsToState(params).q).toBe("rust");
     expect(paramsToState(params).scope).toBe("comments");
     expect(threadFromParams(params)?.rootId).toBe(44123);
+  });
+});
+
+describe("paramsToState", () => {
+  it("keeps a points filter on the News tab", () => {
+    expect(paramsToState(new URLSearchParams("points=100")).minPoints).toBe(100);
+  });
+
+  it("drops a points filter on the Comments tab, where comments have no score", () => {
+    const state = paramsToState(new URLSearchParams("tab=comments&points=100"));
+
+    expect(state.minPoints).toBe(0);
+    expect(hasActiveFilters(state)).toBe(false);
   });
 });
