@@ -123,3 +123,26 @@ so enrichment is kept), verifies the count, deletes those documents from
 settings as a background task. It is checkpointed and safe to re-run.
 Vectors are not copied: re-run `hn-indexer embedder` afterwards if `hn` had
 one.
+
+## Metrics
+
+The indexer exposes Prometheus metrics on `INDEXER_METRICS_ADDR`
+(default `127.0.0.1:9464`; set it to an empty string to disable, and to
+`0.0.0.0:9464` inside a container). Every metric is prefixed `hn_indexer_`
+and all labels are bounded enums — no ids or urls.
+
+| Metric | What it tells you |
+|---|---|
+| `sync_ticks_total{result}` | sync iterations, ok vs error |
+| `hn_maxitem` − `sync_last_max` | how far behind HN the index is |
+| `sync_last_success_timestamp_seconds` | staleness — catches a wedged loop |
+| `sync_new_ids_total`, `sync_docs_indexed_total` | live throughput |
+| `sync_tick_duration_seconds` | histogram of tick wall-clock time |
+| `items_fetched_total{result=ok\|null\|error}` | HN API health (null = deleted/dead) |
+| `backfill_active`, `backfill_cursor`, `backfill_floor` | backfill position |
+| `backfill_ids_processed_total`, `backfill_docs_indexed_total` | backfill throughput |
+| `enrich_attempted_total`, `enrich_extracted_total` | enrichment success rate |
+| `meili_writes_total{result}` | Meilisearch write health |
+
+A bind failure (port already taken by another indexer process) logs a
+warning and continues — metrics are never worth killing indexing over.

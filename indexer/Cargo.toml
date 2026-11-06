@@ -7,6 +7,8 @@ edition = "2021"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 reqwest = { version = "0.12", features = ["json", "gzip"] }
 scraper = "0.23"
 serde = { version = "1", features = ["derive"] }

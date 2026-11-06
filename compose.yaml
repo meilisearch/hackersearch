@@ -23,6 +23,8 @@ services:
     build:
       context: ./indexer
       dockerfile: Dockerfile.dev
+    ports:
+      - "9464:9464"
     depends_on:
       meilisearch:
         condition: service_healthy
@@ -42,6 +44,9 @@ services:
       # Only crawl stories from 2025 onward. The full corpus is a multi-day
       # job; set an earlier date (or empty) to widen the window.
       ENRICH_SINCE: ${ENRICH_SINCE:-2025-01-01}
+      # Prometheus metrics. 0.0.0.0 because 127.0.0.1 inside the container
+      # would make the published port unreachable from the host.
+      INDEXER_METRICS_ADDR: 0.0.0.0:9464
     volumes:
       - indexer_state:/data
       - cargo-registry:/usr/local/cargo/registry

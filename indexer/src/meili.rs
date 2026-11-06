@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use metrics::counter;
 use serde_json::json;
 
 /// Stories, Ask/Show/Launch HN, jobs, polls and poll options — everything
@@ -373,6 +374,7 @@ impl Meili {
             match resp {
                 Ok(r) if r.status().is_success() => {
                     let task: serde_json::Value = r.json().await?;
+                    counter!("hn_indexer_meili_writes_total", "result" => "ok").increment(1);
                     return Ok(task["taskUid"].as_u64());
                 }
                 Ok(r) => {
@@ -387,6 +389,7 @@ impl Meili {
                 .saturating_mul(2)
                 .min(std::time::Duration::from_secs(60));
         }
+        counter!("hn_indexer_meili_writes_total", "result" => "error").increment(1);
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("add_documents: retries exhausted")))
     }
 

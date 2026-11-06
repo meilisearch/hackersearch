@@ -1,6 +1,7 @@
 mod enrich;
 mod hn;
 mod meili;
+mod obs;
 mod split;
 
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
+use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -61,6 +63,15 @@ struct Cli {
         global = true
     )]
     state_file: PathBuf,
+
+    /// Address for the Prometheus /metrics listener; empty string disables it
+    #[arg(
+        long,
+        env = "INDEXER_METRICS_ADDR",
+        default_value = "127.0.0.1:9464",
+        global = true
+    )]
+    metrics_addr: String,
 
     #[command(subcommand)]
     command: Command,
@@ -215,8 +226,19 @@ impl Ctx {
                 let client = self.hn.clone();
                 async move {
                     match hn::fetch_item(&client, id).await {
-                        Ok(item) => item.and_then(hn::to_doc),
+                        Ok(Some(item)) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "ok")
+                                .increment(1);
+                            hn::to_doc(item)
+                        }
+                        Ok(None) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "null")
+                                .increment(1);
+                            None
+                        }
                         Err(e) => {
+                            counter!("hn_indexer_items_fetched_total", "result" => "error")
+                                .increment(1);
                             warn!("skipping item {id}: {e:#}");
                             None
                         }
@@ -244,6 +266,8 @@ impl Ctx {
 async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
     let total = from.saturating_sub(to) + 1;
     info!("backfill: items {to}..={from} ({total} ids)");
+    gauge!("hn_indexer_backfill_active").set(1.0);
+    gauge!("hn_indexer_backfill_floor").set(to as f64);
     let started = Instant::now();
     let mut processed: u64 = 0;
     let mut cursor = from;
@@ -254,6 +278,9 @@ async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
         let chunk_len = ids.len() as u64;
         let docs = ctx.index_ids(ids).await?;
         processed += chunk_len;
+        gauge!("hn_indexer_backfill_cursor").set(low as f64);
+        counter!("hn_indexer_backfill_ids_processed_total").increment(chunk_len);
+        counter!("hn_indexer_backfill_docs_indexed_total").increment(docs as u64);
 
         {
             let mut state = ctx.state.lock().await;
@@ -274,6 +301,7 @@ async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
                 "backfill complete: {processed} ids in {:?}",
                 started.elapsed()
             );
+            gauge!("hn_indexer_backfill_active").set(0.0);
             return Ok(());
         }
         cursor = low - 1;
@@ -311,11 +339,31 @@ async fn sync(ctx: &Ctx, interval: u64) -> Result<()> {
                 state.sync_last_max = last_max;
             }
             ctx.save_state().await?;
+            gauge!("hn_indexer_hn_maxitem").set(max as f64);
+            gauge!("hn_indexer_sync_last_max").set(max as f64);
+            counter!("hn_indexer_sync_new_ids_total").increment(new_count as u64);
+            counter!("hn_indexer_sync_docs_indexed_total").increment(docs as u64);
+            gauge!("hn_indexer_sync_last_success_timestamp_seconds").set(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            );
             info!("sync: {new_count} new ids, {docs} docs indexed (maxitem {max})");
             anyhow::Ok(())
         };
-        if let Err(e) = tick.await {
-            warn!("sync tick failed, will retry: {e:#}");
+        let tick_started = Instant::now();
+        let result = tick.await;
+        histogram!("hn_indexer_sync_tick_duration_seconds")
+            .record(tick_started.elapsed().as_secs_f64());
+        match result {
+            Ok(()) => {
+                counter!("hn_indexer_sync_ticks_total", "result" => "ok").increment(1);
+            }
+            Err(e) => {
+                counter!("hn_indexer_sync_ticks_total", "result" => "error").increment(1);
+                warn!("sync tick failed, will retry: {e:#}");
+            }
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
     }
@@ -593,9 +641,13 @@ async fn enrich_loop(
                 .filter(|u| u[field].as_str().is_some_and(|v| !v.is_empty()))
                 .count() as u64
         };
-        extracted += non_empty("content");
+        let with_content = non_empty("content");
+        extracted += with_content;
         described += non_empty("description");
         attempted += batch_len;
+
+        counter!("hn_indexer_enrich_attempted_total").increment(batch_len);
+        counter!("hn_indexer_enrich_extracted_total").increment(with_content);
 
         // The next fetch_enrichable relies on the `enrich_gen` stamps being
         // visible, so wait for the update task to finish. On a busy index this
@@ -723,6 +775,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    obs::init(&cli.metrics_addr);
 
     let state = if cli.state_file.exists() {
         let raw = tokio::fs::read(&cli.state_file)
@@ -895,11 +948,15 @@ async fn main() -> Result<()> {
                         Ok(Some((from, to))) => match backfill(&backfill_ctx, from, to).await {
                             Ok(()) => break,
                             Err(e) => {
+                                gauge!("hn_indexer_backfill_active").set(0.0);
                                 warn!("backfill failed, resuming from checkpoint in 60s: {e:#}")
                             }
                         },
                         Ok(None) => break,
-                        Err(e) => warn!("backfill setup failed, retrying in 60s: {e:#}"),
+                        Err(e) => {
+                            gauge!("hn_indexer_backfill_active").set(0.0);
+                            warn!("backfill setup failed, retrying in 60s: {e:#}")
+                        }
                     }
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
