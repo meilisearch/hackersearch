@@ -60,6 +60,57 @@ pub const ARTICLE_FRAGMENT: &str = "{{ doc.title }}\
 {% if doc.description and doc.description != \"\" %}\n{{ doc.description }}{% endif %}\
 {% if doc.content and doc.content != \"\" %}\n{{ doc.content | truncatewords: 400 }}{% endif %}";
 
+/// Hugging Face model behind the `granite` embedder, and the exact revision
+/// both halves of the composite must load. Pinned, because the local search
+/// model and the one served behind LUMEN must stay byte-identical: a silent
+/// upstream update on one side only would split the vector space.
+pub const GRANITE_HF_MODEL: &str = "ibm-granite/granite-embedding-107m-multilingual";
+pub const GRANITE_REVISION: &str = "d6cffd338414d6a1c1f5decfad5fec62eebc90d5";
+pub const GRANITE_DIMENSIONS: usize = 384;
+/// The model id LUMEN routes to the TEI endpoint serving [`GRANITE_HF_MODEL`].
+pub const GRANITE_LUMEN_MODEL: &str = "granite-embedding-107m-multilingual";
+
+/// Composite embedder: documents are embedded through LUMEN (a TEI endpoint
+/// on a GPU, batched), queries by the same model running inside Meilisearch,
+/// so search never makes a network call and the GPU endpoint can scale to
+/// zero between indexing runs.
+///
+/// Measured on Meilisearch v1.54 before relying on it:
+///
+/// - Meilisearch's local model and sentence-transformers (what TEI
+///   reimplements, CLS pooling) agree to cosine >= 0.998 on English, French
+///   and German text, so the two halves share one vector space. Meilisearch
+///   does not normalise its vectors and TEI does; cosine ignores the norm.
+/// - `indexingFragments` work inside a composite `indexingEmbedder`, and
+///   still skip untitled documents (see [`ARTICLE_FRAGMENT`]).
+/// - The batched `["{{fragment}}", "{{..}}"]` request form works with
+///   fragments: 200 stories went out as 20 requests, 0 comments sent.
+/// - Partial document updates (points, comment edits) re-embed nothing; a
+///   story's `content` changing re-embeds that story only.
+/// - Searches, including `/similar`, made zero upstream calls.
+///
+/// The fragment truncates to 400 words, which can exceed the model's 512
+/// tokens: the TEI endpoint must run with `AUTO_TRUNCATE=true`.
+fn granite_embedder(url: &str, api_key: &str, model: &str) -> serde_json::Value {
+    json!({
+        "source": "composite",
+        "indexingEmbedder": {
+            "source": "rest",
+            "url": url,
+            "apiKey": api_key,
+            "dimensions": GRANITE_DIMENSIONS,
+            "request": { "model": model, "input": ["{{fragment}}", "{{..}}"] },
+            "response": { "data": [{ "embedding": "{{embedding}}" }, "{{..}}"] },
+            "indexingFragments": { "article": { "value": ARTICLE_FRAGMENT } },
+        },
+        "searchEmbedder": {
+            "source": "huggingFace",
+            "model": GRANITE_HF_MODEL,
+            "revision": GRANITE_REVISION,
+        },
+    })
+}
+
 /// A story waiting to be enriched.
 pub struct Enrichable {
     pub id: u64,
@@ -556,6 +607,7 @@ impl Meili {
     /// Returns the uid of the settings task, which is where embedding
     /// progress and failures show up.
     pub async fn apply_embedder(&self, kind: &str) -> Result<Option<u64>> {
+        let non_empty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
         let (default_url, model_var, default_model, key_var) = match kind {
             "openai" => (
                 "https://api.openai.com/v1/embeddings",
@@ -569,16 +621,25 @@ impl Meili {
                 "voyage-3.5-lite",
                 "VOYAGE_API_KEY",
             ),
-            // Meilisearch only supports indexing fragments on the `rest`
-            // source; a huggingFace embedder can only use documentTemplate,
-            // which embeds every document — untitled poll options as "".
-            "huggingface" => anyhow::bail!(
-                "the local huggingFace embedder cannot skip untitled documents \
-                 (indexing fragments are rest-only) — use openai or voyage"
+            // Documents are embedded by the model served behind LUMEN, queries
+            // by the same model running inside Meilisearch. See
+            // `granite_embedder` for why that split is sound.
+            "granite" => (
+                "https://lumen.meilisearch.com/v1/embeddings",
+                "GRANITE_EMBED_MODEL",
+                GRANITE_LUMEN_MODEL,
+                "LUMEN_API_KEY",
             ),
-            other => anyhow::bail!("unknown embedder '{other}' (openai|voyage)"),
+            // Meilisearch only supports indexing fragments on the `rest`
+            // source; a plain huggingFace embedder can only use
+            // documentTemplate, which embeds every document — untitled poll
+            // options as "". `granite` keeps the local model for queries only.
+            "huggingface" => anyhow::bail!(
+                "a plain huggingFace embedder cannot skip untitled documents \
+                 (indexing fragments are rest-only) — use granite, openai or voyage"
+            ),
+            other => anyhow::bail!("unknown embedder '{other}' (granite|openai|voyage)"),
         };
-        let non_empty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
         let api_key =
             non_empty(key_var).with_context(|| format!("embedder '{kind}' needs {key_var}"))?;
         let model = non_empty(model_var).unwrap_or_else(|| default_model.to_string());
@@ -598,24 +659,43 @@ impl Meili {
         };
         tracing::info!("embedder: {url} model={model} dimensions={dimensions}");
 
-        // Indexing/search fragments are gated behind this experimental flag.
+        let (embedder, features) = if kind == "granite" {
+            anyhow::ensure!(
+                dimensions == GRANITE_DIMENSIONS,
+                "{url} returned {dimensions}-dimensional vectors for '{model}', but the local \
+                 search model produces {GRANITE_DIMENSIONS}: the gateway is not serving \
+                 {GRANITE_HF_MODEL}"
+            );
+            (
+                granite_embedder(&url, &api_key, &model),
+                // Fragments need `multimodal`; the indexing/search split needs
+                // `compositeEmbedders`.
+                json!({ "multimodal": true, "compositeEmbedders": true }),
+            )
+        } else {
+            (
+                json!({
+                    "source": "rest",
+                    "url": url,
+                    "apiKey": api_key,
+                    "dimensions": dimensions,
+                    "request": { "model": model, "input": "{{fragment}}" },
+                    "response": { "data": [{ "embedding": "{{embedding}}" }] },
+                    "indexingFragments": { "article": { "value": ARTICLE_FRAGMENT } },
+                    "searchFragments": { "query": { "value": "{{ q }}" } },
+                }),
+                // Indexing/search fragments are gated behind this experimental flag.
+                json!({ "multimodal": true }),
+            )
+        };
+
         self.request(reqwest::Method::PATCH, "/experimental-features")
-            .json(&json!({ "multimodal": true }))
+            .json(&features)
             .send()
             .await?
             .error_for_status()
-            .context("enabling the multimodal experimental feature")?;
+            .context("enabling the experimental features the embedder needs")?;
 
-        let embedder = json!({
-            "source": "rest",
-            "url": url,
-            "apiKey": api_key,
-            "dimensions": dimensions,
-            "request": { "model": model, "input": "{{fragment}}" },
-            "response": { "data": [{ "embedding": "{{embedding}}" }] },
-            "indexingFragments": { "article": { "value": ARTICLE_FRAGMENT } },
-            "searchFragments": { "query": { "value": "{{ q }}" } },
-        });
         let task = self
             .request(
                 reqwest::Method::PATCH,
@@ -685,6 +765,32 @@ mod tests {
         assert!(
             !ARTICLE_FRAGMENT.contains("doc.text"),
             "poll-option and Ask HN body text is not embedded"
+        );
+    }
+
+    /// The composite's two halves must load the same model at the same
+    /// revision, and the indexing half must keep the untitled-skipping fragment.
+    #[test]
+    fn granite_embedder_is_a_consistent_composite() {
+        let e = granite_embedder("https://gw/v1/embeddings", "k", GRANITE_LUMEN_MODEL);
+        assert_eq!(e["source"], "composite");
+        let search = &e["searchEmbedder"];
+        assert_eq!(search["source"], "huggingFace");
+        assert_eq!(search["model"], GRANITE_HF_MODEL);
+        assert_eq!(search["revision"], GRANITE_REVISION);
+        let indexing = &e["indexingEmbedder"];
+        assert_eq!(indexing["dimensions"], GRANITE_DIMENSIONS);
+        assert_eq!(
+            indexing["indexingFragments"]["article"]["value"],
+            ARTICLE_FRAGMENT
+        );
+        assert_eq!(
+            indexing["request"]["input"],
+            json!(["{{fragment}}", "{{..}}"])
+        );
+        assert!(
+            indexing.get("documentTemplate").is_none(),
+            "a documentTemplate would embed untitled documents too"
         );
     }
 
