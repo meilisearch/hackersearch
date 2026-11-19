@@ -185,6 +185,14 @@ fn comments_settings() -> serde_json::Value {
     })
 }
 
+/// A task's state as seen by one non-blocking look at `/tasks/{uid}`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskOutcome {
+    Pending,
+    Succeeded,
+    Failed(String),
+}
+
 pub struct Meili {
     client: reqwest::Client,
     base: String,
@@ -341,7 +349,8 @@ impl Meili {
     /// whole index, so the task is returned rather than waited on.
     pub async fn apply_dictionary(&self, uid: &str) -> Result<Option<u64>> {
         self.refuse_legacy().await?;
-        self.patch_settings(uid, &json!({ "dictionary": DICTIONARY })).await
+        self.patch_settings(uid, &json!({ "dictionary": DICTIONARY }))
+            .await
     }
 
     /// Upsert documents. Uses PUT (add-or-UPDATE) rather than POST
@@ -408,6 +417,26 @@ impl Meili {
                 _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
             }
         }
+    }
+
+    /// Where a task stands, without waiting for it. A task Meilisearch no
+    /// longer knows (404) counts as failed: its outcome can't be confirmed.
+    pub async fn task_outcome(&self, uid: u64) -> Result<TaskOutcome> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/tasks/{uid}"))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(TaskOutcome::Failed("task not found".into()));
+        }
+        let task: serde_json::Value = resp.error_for_status()?.json().await?;
+        Ok(match task["status"].as_str().unwrap_or("") {
+            "succeeded" => TaskOutcome::Succeeded,
+            status @ ("failed" | "canceled") => {
+                TaskOutcome::Failed(format!("{status}: {}", task["error"]))
+            }
+            _ => TaskOutcome::Pending,
+        })
     }
 
     /// One page of full documents matching `filter`, plus the total number
@@ -733,7 +762,12 @@ mod tests {
     /// reposts titled exactly like the query bury the original story.
     #[test]
     fn points_rank_before_word_position_and_exactness() {
-        let pos = |rule: &str| STORIES_RANKING_RULES.iter().position(|r| *r == rule).unwrap();
+        let pos = |rule: &str| {
+            STORIES_RANKING_RULES
+                .iter()
+                .position(|r| *r == rule)
+                .unwrap()
+        };
         assert!(pos("points:desc") < pos("wordPosition"));
         assert!(pos("points:desc") < pos("exactness"));
         assert!(pos("attributeRank") < pos("points:desc"));
