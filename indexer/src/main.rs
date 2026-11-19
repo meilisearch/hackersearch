@@ -3,6 +3,7 @@ mod hn;
 mod meili;
 mod split;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::meili::Meili;
 
@@ -186,6 +187,64 @@ struct State {
     sync_last_max: Option<u64>,
     /// `split`: documents already copied into the stories index.
     split_copied: Option<u64>,
+    /// Story writes sync submitted whose Meilisearch task has not been seen
+    /// to finish yet. Accepting a write is not indexing it: the task can
+    /// still fail (an embedder outage fails the whole batch).
+    #[serde(default)]
+    sync_story_tasks: Vec<StoryTask>,
+    /// Stories whose write task failed. Sync replays them once story writes
+    /// succeed again, so an outage delays stories instead of dropping them.
+    #[serde(default)]
+    sync_story_retry: BTreeSet<u64>,
+}
+
+/// One submitted story write: the Meilisearch task and the stories in it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StoryTask {
+    task: u64,
+    ids: Vec<u64>,
+}
+
+/// Stories replayed per sync tick once writes succeed again.
+const STORY_RETRY_CHUNK: usize = 500;
+
+/// Fold the outcomes of the outstanding story tasks into `state`: finished
+/// tasks leave the list, and the stories of a failed one join the retry set.
+/// Returns whether story writes are known to work right now (at least one
+/// task succeeded and none failed), which is when replaying is worth it.
+fn settle_story_tasks(state: &mut State, outcomes: &[(u64, meili::TaskOutcome)]) -> bool {
+    let (mut succeeded, mut failed) = (0, 0);
+    for (uid, outcome) in outcomes {
+        let Some(pos) = state.sync_story_tasks.iter().position(|t| t.task == *uid) else {
+            continue;
+        };
+        match outcome {
+            meili::TaskOutcome::Pending => {}
+            meili::TaskOutcome::Succeeded => {
+                state.sync_story_tasks.remove(pos);
+                succeeded += 1;
+            }
+            meili::TaskOutcome::Failed(reason) => {
+                let task = state.sync_story_tasks.remove(pos);
+                state.sync_story_retry.extend(task.ids.iter().copied());
+                failed += 1;
+                error!(
+                    "sync: story write task {uid} did not index its {} stories, \
+                     {} now waiting for a retry: {reason}",
+                    task.ids.len(),
+                    state.sync_story_retry.len()
+                );
+            }
+        }
+    }
+    succeeded > 0 && failed == 0
+}
+
+/// What one `index_ids` call wrote.
+struct Indexed {
+    docs: usize,
+    /// The stories written and the task carrying them, if there were any.
+    story_task: Option<StoryTask>,
 }
 
 struct Ctx {
@@ -208,8 +267,9 @@ impl Ctx {
     }
 
     /// Fetch a set of ids concurrently and index whatever converts to a doc.
-    /// Returns the number of documents indexed.
-    async fn index_ids(&self, ids: Vec<u64>) -> Result<usize> {
+    /// "Indexed" means submitted: the writes are Meilisearch tasks that may
+    /// still fail, which is why the story task is handed back.
+    async fn index_ids(&self, ids: Vec<u64>) -> Result<Indexed> {
         let docs: Vec<_> = stream::iter(ids)
             .map(|id| {
                 let client = self.hn.clone();
@@ -231,13 +291,21 @@ impl Ctx {
         let (comments, stories): (Vec<_>, Vec<_>) = docs
             .into_iter()
             .partition(|doc| meili::index_for(&doc.kind) == meili::COMMENTS_INDEX);
-        self.meili
+        let story_task = self
+            .meili
             .add_documents(meili::STORIES_INDEX, &stories)
-            .await?;
+            .await?
+            .map(|task| StoryTask {
+                task,
+                ids: stories.iter().map(|doc| doc.id).collect(),
+            });
         self.meili
             .add_documents(meili::COMMENTS_INDEX, &comments)
             .await?;
-        Ok(total)
+        Ok(Indexed {
+            docs: total,
+            story_task,
+        })
     }
 }
 
@@ -252,7 +320,7 @@ async fn backfill(ctx: &Ctx, from: u64, to: u64) -> Result<()> {
         let low = cursor.saturating_sub(ctx.batch_size as u64 - 1).max(to);
         let ids: Vec<u64> = (low..=cursor).rev().collect();
         let chunk_len = ids.len() as u64;
-        let docs = ctx.index_ids(ids).await?;
+        let docs = ctx.index_ids(ids).await?.docs;
         processed += chunk_len;
 
         {
@@ -301,17 +369,60 @@ async fn sync(ctx: &Ctx, interval: u64) -> Result<()> {
             };
             let new_count = ids.len();
             ids.extend(hn::updated_items(&ctx.hn).await.unwrap_or_default());
+
+            // Look at the story writes of earlier ticks. Their tasks take
+            // minutes on a busy queue, so this never waits: it only reads
+            // where each one stands.
+            let outstanding: Vec<u64> = {
+                let state = ctx.state.lock().await;
+                state.sync_story_tasks.iter().map(|t| t.task).collect()
+            };
+            let mut outcomes = Vec::with_capacity(outstanding.len());
+            for uid in outstanding {
+                outcomes.push((uid, ctx.meili.task_outcome(uid).await?));
+            }
+            // Replay failed stories only when a write just went through:
+            // during an outage that would resubmit them every tick.
+            let retry: Vec<u64> = {
+                let mut state = ctx.state.lock().await;
+                if settle_story_tasks(&mut state, &outcomes) {
+                    state
+                        .sync_story_retry
+                        .iter()
+                        .take(STORY_RETRY_CHUNK)
+                        .copied()
+                        .collect()
+                } else {
+                    vec![]
+                }
+            };
+            ids.extend(&retry);
             ids.sort_unstable();
             ids.dedup();
 
-            let docs = ctx.index_ids(ids).await?;
+            let indexed = ctx.index_ids(ids).await?;
             last_max = Some(max);
-            {
+            let waiting = {
                 let mut state = ctx.state.lock().await;
                 state.sync_last_max = last_max;
-            }
+                // Resubmitted: from here on the new task answers for them.
+                for id in &retry {
+                    state.sync_story_retry.remove(id);
+                }
+                state.sync_story_tasks.extend(indexed.story_task);
+                state.sync_story_retry.len()
+            };
             ctx.save_state().await?;
-            info!("sync: {new_count} new ids, {docs} docs indexed (maxitem {max})");
+            if !retry.is_empty() {
+                info!(
+                    "sync: resubmitted {} stories whose write had failed, {waiting} still waiting",
+                    retry.len()
+                );
+            }
+            info!(
+                "sync: {new_count} new ids, {} docs submitted (maxitem {max})",
+                indexed.docs
+            );
             anyhow::Ok(())
         };
         if let Err(e) = tick.await {
@@ -959,6 +1070,66 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_with_tasks(tasks: &[(u64, &[u64])]) -> State {
+        State {
+            sync_story_tasks: tasks
+                .iter()
+                .map(|(task, ids)| StoryTask {
+                    task: *task,
+                    ids: ids.to_vec(),
+                })
+                .collect(),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn failed_story_task_queues_its_stories_for_retry() {
+        let mut state = state_with_tasks(&[(1, &[10, 11]), (2, &[12]), (3, &[13])]);
+        let healthy = settle_story_tasks(
+            &mut state,
+            &[
+                (1, meili::TaskOutcome::Failed("embedder down".into())),
+                (2, meili::TaskOutcome::Succeeded),
+                (3, meili::TaskOutcome::Pending),
+            ],
+        );
+        // A failure in the same look means writes are not reliably back.
+        assert!(!healthy);
+        assert_eq!(state.sync_story_retry, BTreeSet::from([10, 11]));
+        assert_eq!(
+            state.sync_story_tasks,
+            state_with_tasks(&[(3, &[13])]).sync_story_tasks
+        );
+    }
+
+    #[test]
+    fn story_writes_are_healthy_only_after_a_success() {
+        let mut state = state_with_tasks(&[(1, &[10]), (2, &[11])]);
+        assert!(!settle_story_tasks(&mut state, &[]));
+        assert!(!settle_story_tasks(
+            &mut state,
+            &[(1, meili::TaskOutcome::Pending)]
+        ));
+        assert!(settle_story_tasks(
+            &mut state,
+            &[(1, meili::TaskOutcome::Succeeded)]
+        ));
+        assert_eq!(state.sync_story_tasks.len(), 1);
+        assert!(state.sync_story_retry.is_empty());
+    }
+
+    #[test]
+    fn state_files_from_before_story_tracking_still_load() {
+        let state: State = serde_json::from_str(
+            r#"{"backfill_cursor":null,"backfill_floor":null,"sync_last_max":50560470,"split_copied":null}"#,
+        )
+        .unwrap();
+        assert_eq!(state.sync_last_max, Some(50560470));
+        assert!(state.sync_story_tasks.is_empty());
+        assert!(state.sync_story_retry.is_empty());
+    }
 
     fn attempt(outcome: enrich::CfOutcome, retries: u32, secs: u64) -> enrich::CfAttempt {
         enrich::CfAttempt {

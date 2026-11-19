@@ -104,6 +104,15 @@ populated index. On production, use the narrow commands instead: `ranking` is
 applied at search time and never reindexes; `dictionary` reindexes only the
 index you name.
 
+`sync` follows up on its story writes. Meilisearch accepting a write does not
+mean the task succeeds: with an embedder on `hn-stories`, an embedding outage
+fails every story batch while comments keep indexing. Each tick reads where
+the earlier story tasks stand, without waiting on them. A failed one logs an
+`ERROR` line starting `sync: story write task` (worth an alert) and puts its
+stories in `sync_story_retry` in the state file. They are resubmitted, 500
+per tick, as soon as a story write goes through again. `backfill` does not
+do this; check its tasks yourself after a large run.
+
 | Env var | Default | Purpose |
 |---|---|---|
 | `MEILI_URL` | `http://localhost:7700` | Meilisearch endpoint |
